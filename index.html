@@ -228,7 +228,7 @@ async function squarePng(bytes){
 $('go').addEventListener('click', async ()=>{
   if(!filesList.length){ log('Pick at least one .zip first.','w'); return; }
   $('go').disabled=true; $('downloads').innerHTML=''; $('outPanel').style.display='none';
-  const opts={ density:'1/4', sign:'+', headtap:true, flicktap:false };
+  const opts={ density:'1/4', sign:'-', headtap:true, flicktap:false };
   let done=0;
   for(let i=0;i<filesList.length;i++){
     const f=filesList[i];
