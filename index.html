@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>UGC &rarr; DR3</title>
+<style>
+  :root{
+    --bg:#04060f; --panel:rgba(8,14,34,.82); --panel2:rgba(6,11,28,.92);
+    --line:#1d2c63; --line2:#2c3f86; --ink:#9fb6ff; --ink-dim:#5c72b8;
+    --accent:#3a5cff; --accent-soft:#1a2a78; --good:#5fe0a0; --warn:#ffb24c; --bad:#ff5d5d;
+    --fg:#cdd8ff;
+  }
+  *{box-sizing:border-box;border-radius:0!important}
+  html,body{margin:0;height:100%}
+  body{
+    font:14px/1.5 "Consolas","SFMono-Regular",Menlo,monospace;
+    color:var(--fg); background:var(--bg);
+    background-image:linear-gradient(rgba(2,4,12,.45),rgba(2,4,12,.78)),url("background.png");
+    background-size:cover; background-position:center; background-attachment:fixed;
+    min-height:100vh; padding:24px 14px 60px;
+    display:flex; flex-direction:column; align-items:center;
+    -webkit-text-size-adjust:100%;
+  }
+  .wrap{width:100%; max-width:760px}
+  header{margin-bottom:18px}
+  h1{
+    font-size:26px; font-weight:700; letter-spacing:.18em; margin:0;
+    color:#dfe8ff; text-shadow:0 0 14px rgba(58,92,255,.55);
+  }
+  h1 .sep{color:var(--accent)}
+  .tag{color:var(--ink-dim); letter-spacing:.12em; margin-top:6px; font-size:12px}
+
+  .panel{background:var(--panel); border:1px solid var(--line); padding:16px; margin-bottom:14px;
+    box-shadow:0 0 0 1px rgba(0,0,0,.4), 0 18px 40px rgba(0,0,0,.45)}
+  .panel h2{font-size:12px; letter-spacing:.18em; color:var(--ink); margin:0 0 12px;
+    text-transform:uppercase; font-weight:700}
+
+  /* drop / file zone */
+  .drop{border:1px dashed var(--line2); background:var(--panel2); padding:26px 16px; text-align:center;
+    color:var(--ink-dim); cursor:pointer; transition:background .12s,border-color .12s}
+  .drop.hover{background:rgba(26,42,120,.35); border-color:var(--accent); color:var(--ink)}
+  .drop b{color:#dfe8ff}
+  .drop input{display:none}
+  .files{margin-top:10px; font-size:12px; color:var(--ink)}
+  .files div{padding:2px 0; color:var(--ink-dim)}
+  .files div b{color:#cfe}
+
+  /* options */
+  .opts{display:flex; flex-wrap:wrap; gap:14px 20px; align-items:center; font-size:12px; color:var(--ink-dim)}
+  .opts label{display:flex; gap:7px; align-items:center; color:var(--ink)}
+  .opts input[type=text]{width:60px}
+  input[type=text],select{background:#060b1f; color:var(--fg); border:1px solid var(--line2);
+    padding:5px 7px; font:inherit}
+  input[type=checkbox]{width:15px; height:15px; accent-color:var(--accent)}
+  select{padding:5px 6px}
+
+  /* button */
+  button{font:inherit; letter-spacing:.12em; text-transform:uppercase; font-weight:700;
+    color:#dfe8ff; background:var(--accent-soft); border:1px solid var(--line2);
+    padding:13px 20px; cursor:pointer; width:100%; transition:background .12s, box-shadow .12s}
+  button:hover:not(:disabled){background:#21338f; box-shadow:0 0 16px rgba(58,92,255,.5)}
+  button:disabled{opacity:.45; cursor:not-allowed}
+
+  /* progress */
+  .bar{height:18px; background:#060b1f; border:1px solid var(--line2); margin-top:14px; position:relative; overflow:hidden}
+  .bar > i{display:block; height:100%; width:0%; background:linear-gradient(90deg,#23409e,var(--accent));
+    box-shadow:0 0 12px rgba(58,92,255,.7); transition:width .2s}
+  .bar > span{position:absolute; inset:0; text-align:center; font-size:11px; line-height:18px;
+    letter-spacing:.14em; color:#cdd8ff; text-shadow:0 0 4px #000}
+
+  /* downloads + log */
+  .out a{display:flex; justify-content:space-between; gap:10px; align-items:center;
+    text-decoration:none; color:#cfe; background:var(--panel2); border:1px solid var(--line2);
+    padding:11px 13px; margin-bottom:8px}
+  .out a:hover{border-color:var(--accent); box-shadow:0 0 12px rgba(58,92,255,.4)}
+  .out a span:last-child{color:var(--good); letter-spacing:.12em; font-size:12px}
+  .log{white-space:pre-wrap; font-size:11.5px; color:var(--ink-dim); max-height:260px; overflow:auto;
+    background:#05091a; border:1px solid var(--line); padding:11px; margin-top:4px}
+  .log .ok{color:var(--good)} .log .w{color:var(--warn)} .log .e{color:var(--bad)} .log .h{color:#cfe}
+  footer{color:var(--ink-dim); font-size:11px; letter-spacing:.1em; margin-top:8px; text-align:center}
+  a.link{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>UGC <span class="sep">&rsaquo;&rsaquo;</span> DR3</h1>
+    <div class="tag">UMiGuri / Chunithm charts &rarr; DanceRail3 &middot; runs entirely in your browser</div>
+  </header>
+
+  <div class="panel">
+    <h2>1 &middot; Choose chart zips</h2>
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".zip" multiple>
+      <div>Tap to pick <b>.zip</b> files &mdash; or drag them here</div>
+      <div class="files" id="files"></div>
+    </label>
+  </div>
+
+  <div class="panel">
+    <h2>2 &middot; Options</h2>
+    <div class="opts">
+      <label>LN density <input type="text" id="density" value="1/4"></label>
+      <label>Offset
+        <select id="sign"><option value="+">+ (normal)</option><option value="-">&minus; (flip)</option></select>
+      </label>
+      <label><input type="checkbox" id="headtap" checked> Strict tap on LN heads</label>
+      <label><input type="checkbox" id="flicktap"> Strict tap on flicks</label>
+    </div>
+  </div>
+
+  <div class="panel">
+    <button id="go" disabled>Loading engine&hellip;</button>
+    <div class="bar"><i id="fill"></i><span id="ptext">0%</span></div>
+  </div>
+
+  <div class="panel out" id="outPanel" style="display:none">
+    <h2>3 &middot; Download</h2>
+    <div id="downloads"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <div class="log" id="log"></div>
+  </div>
+
+  <footer>No upload &mdash; conversion happens on your device. Powered by Pyodide &amp; ffmpeg.wasm.</footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/util.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(msg, cls){ const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=msg+"\n"; logEl.appendChild(s); logEl.scrollTop=logEl.scrollHeight; }
+function setProgress(p, text){ p=Math.max(0,Math.min(100,p)); $('fill').style.width=p+'%'; $('ptext').textContent=text||Math.round(p)+'%'; }
+
+let pyodide=null, ffmpeg=null, ffLog='', filesList=[], wc=null;
+
+// ---------- init ----------
+(async function init(){
+  try{
+    setProgress(5,'Loading Python\u2026'); log('Loading Pyodide\u2026','h');
+    pyodide = await loadPyodide();
+    setProgress(35,'Loading converter\u2026');
+    const src = await (await fetch('ugc2dr3.py')).text();
+    // import as a MODULE (not __main__) so its CLI main() never runs
+    pyodide.FS.writeFile('ugc2dr3.py', src);
+    pyodide.runPython("import sys; sys.path.insert(0,'.'); import ugc2dr3");
+    wc = pyodide.runPython("ugc2dr3.web_convert");
+    log('Converter loaded.','ok');
+
+    setProgress(55,'Loading ffmpeg\u2026'); log('Loading ffmpeg.wasm\u2026','h');
+    const { FFmpeg } = FFmpegWASM; const { toBlobURL } = FFmpegUtil;
+    ffmpeg = new FFmpeg();
+    ffmpeg.on('log', ({ message }) => { ffLog += message + "\n"; });
+    const core='https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${core}/ffmpeg-core.js`,'text/javascript'),
+      wasmURL: await toBlobURL(`${core}/ffmpeg-core.wasm`,'application/wasm'),
+    });
+    log('ffmpeg.wasm ready.','ok');
+    setProgress(100,'Ready'); setTimeout(()=>setProgress(0,'0%'),400);
+    $('go').disabled=false; $('go').textContent='Convert';
+  }catch(e){ log('Init failed: '+e,'e'); $('go').textContent='Engine failed to load'; }
+})();
+
+// ---------- file picking ----------
+const drop=$('drop'), fileInput=$('file');
+fileInput.addEventListener('change', e=> addFiles(e.target.files));
+['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('hover');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('hover');}));
+drop.addEventListener('drop', e=> addFiles(e.dataTransfer.files));
+function addFiles(fl){
+  for(const f of fl){ if(f.name.toLowerCase().endsWith('.zip')) filesList.push(f); }
+  $('files').innerHTML = filesList.map(f=>`<div><b>${f.name}</b></div>`).join('') || '';
+}
+
+// ---------- ffmpeg helpers ----------
+async function probe(name){
+  ffLog=''; try{ await ffmpeg.exec(['-hide_banner','-i',name]); }catch(_){}
+  const t=ffLog;
+  const sr = (t.match(/(\d+) Hz/)||[])[1];
+  let ch = /Hz, stereo/.test(t)?2 : /Hz, mono/.test(t)?1 : parseInt((t.match(/(\d+) channels/)||[])[1]||'0',10);
+  const hasVideo = /\bVideo:/.test(t);
+  const dm = t.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const dur = dm ? (+dm[1])*3600+(+dm[2])*60+parseFloat(dm[3]) : 0;
+  return { sr:sr?+sr:0, ch:ch||0, hasVideo, dur };
+}
+async function peakDb(name){
+  ffLog=''; try{ await ffmpeg.exec(['-hide_banner','-i',name,'-vn','-af','volumedetect','-f','null','-']); }catch(_){}
+  const m=ffLog.match(/max_volume:\s*(-?[\d.]+) dB/); return m?parseFloat(m[1]):0;
+}
+// Mirror prepare_audio() from ugc2dr3.py: -vn, normalize(<-0.5 -> 0dB), 44100, stereo, apad.
+async function makeOgg(inBytes, inName, needSeconds){
+  await ffmpeg.writeFile(inName, inBytes);
+  const info = await probe(inName);
+  const peak = await peakDb(inName);
+  const target = needSeconds + 2.0;
+  const pad = info.dur>0 && target > info.dur+0.05;
+  const filters=[], out=['-vn'], notes=[];
+  if(peak < -0.5){ filters.push(`volume=${(0-peak).toFixed(2)}dB`); notes.push(`normalized ${peak.toFixed(1)}\u21920 dB`); }
+  if(info.sr && info.sr!==44100){ out.push('-ar','44100'); notes.push(`${info.sr}\u219244100 Hz`); }
+  if(info.ch && info.ch!==2){ out.push('-ac','2'); notes.push((info.ch===1?'mono':info.ch+'ch')+'\u2192stereo'); }
+  if(pad){ filters.push(`apad=whole_dur=${target.toFixed(3)}`); notes.push(`padded ${info.dur.toFixed(1)}\u2192${target.toFixed(1)}s`); }
+  // lossless fast path
+  if(notes.length===0 && inName.toLowerCase().endsWith('.ogg') && !info.hasVideo){
+    log('   audio: already DR3-ready, copied','ok');
+    try{ await ffmpeg.deleteFile(inName); }catch(_){}
+    return inBytes;
+  }
+  const args=['-y','-i',inName,...out];
+  if(filters.length) args.splice(3,0,'-af',filters.join(','));
+  args.push('-c:a','libvorbis','-q:a','6','out.ogg');
+  await ffmpeg.exec(args);
+  const data = await ffmpeg.readFile('out.ogg');
+  log('   audio: '+ (notes.length?notes.join('; '):'re-encoded') + (info.hasVideo?'; stripped embedded art':''),'ok');
+  try{ await ffmpeg.deleteFile(inName); await ffmpeg.deleteFile('out.ogg'); }catch(_){}
+  return data;
+}
+async function squarePng(bytes){
+  const bmp = await createImageBitmap(new Blob([bytes]));
+  const s = Math.min(bmp.width, bmp.height);
+  const cv=document.createElement('canvas'); cv.width=cv.height=s;
+  cv.getContext('2d').drawImage(bmp,(bmp.width-s)/2,(bmp.height-s)/2,s,s,0,0,s,s);
+  const blob=await new Promise(r=>cv.toBlob(r,'image/png'));
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+// ---------- main convert ----------
+$('go').addEventListener('click', async ()=>{
+  if(!filesList.length){ log('Pick at least one .zip first.','w'); return; }
+  $('go').disabled=true; $('downloads').innerHTML=''; $('outPanel').style.display='none';
+  const opts={ density:$('density').value||'1/4', sign:$('sign').value,
+               headtap:$('headtap').checked, flicktap:$('flicktap').checked };
+  let done=0;
+  for(let i=0;i<filesList.length;i++){
+    const f=filesList[i];
+    const baseP = i/filesList.length*100, step=100/filesList.length;
+    try{
+      log('\u2500\u2500 '+f.name,'h');
+      setProgress(baseP+step*0.1,'Reading\u2026');
+      const zip = await JSZip.loadAsync(await f.arrayBuffer());
+
+      // write entries into Pyodide FS: real bytes for .ugc, empty placeholders else
+      const work='/work/'+i; pyodide.FS.mkdirTree(work);
+      const entries=[];
+      zip.forEach((path,zo)=>{ if(!zo.dir) entries.push([path,zo]); });
+      for(const [path,zo] of entries){
+        const full=work+'/'+path; const dir=full.slice(0,full.lastIndexOf('/'));
+        pyodide.FS.mkdirTree(dir);
+        if(path.toLowerCase().endsWith('.ugc')) pyodide.FS.writeFile(full, await zo.async('uint8array'));
+        else pyodide.FS.writeFile(full, new Uint8Array(0));
+      }
+
+      setProgress(baseP+step*0.3,'Converting notes\u2026');
+      const plan = JSON.parse(wc(work, '', '', opts.density, opts.headtap, opts.flicktap, opts.sign));
+      if(plan.error){ log('   ERROR: '+plan.error,'e'); continue; }
+      plan.log.forEach(l=>log('   '+l));
+      (plan.warnings||[]).forEach(w=>log('   WARNING: '+w,'w'));
+
+      const out=new JSZip();
+      for(const [name,text] of Object.entries(plan.out_text)) out.file(name, text);
+
+      // audio
+      if(plan.audio_rel && zip.file(plan.audio_rel)){
+        setProgress(baseP+step*0.5,'Processing audio\u2026');
+        const inBytes=await zip.file(plan.audio_rel).async('uint8array');
+        const inName='in'+(plan.audio_rel.match(/\.[a-z0-9]+$/i)||['.mp3'])[0];
+        out.file(plan.ogg_name, await makeOgg(inBytes, inName, plan.need_seconds));
+      } else log('   WARNING: audio not found in zip','w');
+
+      // jacket
+      if(plan.jacket_rel && zip.file(plan.jacket_rel)){
+        setProgress(baseP+step*0.8,'Jacket\u2026');
+        out.file(plan.png_name, await squarePng(await zip.file(plan.jacket_rel).async('uint8array')));
+        log('   jacket: cropped to square PNG','ok');
+      } else log('   WARNING: jacket not found in zip','w');
+
+      setProgress(baseP+step*0.92,'Packaging\u2026');
+      const blob=await out.generateAsync({type:'blob',compression:'DEFLATE'});
+      const outName='DR_'+f.name.replace(/\.zip$/i,'')+'.zip';
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob); a.download=outName;
+      a.innerHTML=`<span>${outName}</span><span>Download \u2193</span>`;
+      $('downloads').appendChild(a); $('outPanel').style.display='block';
+      log('   done \u2192 '+outName,'ok'); done++;
+    }catch(e){ log('   ERROR: '+(e&&e.message||e),'e'); }
+    setProgress((i+1)/filesList.length*100, `${i+1}/${filesList.length}`);
+  }
+  log(`\nFinished: ${done}/${filesList.length} converted.`, done?'ok':'e');
+  $('go').disabled=false;
+});
+</script>
+</body>
+</html>
