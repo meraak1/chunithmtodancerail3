@@ -94,7 +94,7 @@
 
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const logEl = $('log');
@@ -117,13 +117,25 @@ const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>
     wc = pyodide.runPython("ugc2dr3.web_convert");
     log('Converter loaded.','ok');
 
-    setProgress(55,'Loading ffmpeg\u2026'); log('Loading ffmpeg.wasm (~25MB first time)\u2026','h');
-    const { createFFmpeg } = FFmpeg;
-    ffmpeg = createFFmpeg({
-      corePath:'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
-      log:false, logger:({ message })=>{ ffLog += message + "\n"; },
-    });
-    await withTimeout(ffmpeg.load(), 180000,
+    setProgress(55,'Loading ffmpeg\u2026'); log('Loading ffmpeg.wasm (~30MB first time)\u2026','h');
+    const { FFmpeg } = FFmpegWASM;
+    const toBlobURL = async (url,mime)=>{
+      const r = await fetch(url);
+      if(!r.ok) throw new Error('fetch '+r.status+' for '+url);
+      return URL.createObjectURL(new Blob([await r.arrayBuffer()], {type:mime}));
+    };
+    // single-thread core => no SharedArrayBuffer (works on GitHub Pages, no special headers).
+    // worker loaded as a same-origin blob => no cross-origin Worker SecurityError.
+    const ff='https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd';
+    const core='https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+    ffmpeg = new FFmpeg();
+    ffmpeg.on('log', ({ message })=>{ ffLog += message + "\n"; });
+    const [classWorkerURL, coreURL, wasmURL] = await Promise.all([
+      toBlobURL(`${ff}/814.ffmpeg.js`, 'text/javascript'),
+      toBlobURL(`${core}/ffmpeg-core.js`, 'text/javascript'),
+      toBlobURL(`${core}/ffmpeg-core.wasm`, 'application/wasm'),
+    ]);
+    await withTimeout(ffmpeg.load({ classWorkerURL, coreURL, wasmURL }), 180000,
       'ffmpeg failed to load (network blocked or too slow). Reload to retry.');
     log('ffmpeg.wasm ready.','ok');
     setProgress(100,'Ready'); setTimeout(()=>setProgress(0,'0%'),400);
@@ -144,7 +156,7 @@ function addFiles(fl){
 
 // ---------- ffmpeg helpers ----------
 async function probe(name){
-  ffLog=''; try{ await ffmpeg.run('-hide_banner','-i',name); }catch(_){}
+  ffLog=''; try{ await ffmpeg.exec(['-hide_banner','-i',name]); }catch(_){}
   const t=ffLog;
   const sr = (t.match(/(\d+) Hz/)||[])[1];
   let ch = /Hz, stereo/.test(t)?2 : /Hz, mono/.test(t)?1 : parseInt((t.match(/(\d+) channels/)||[])[1]||'0',10);
@@ -154,12 +166,12 @@ async function probe(name){
   return { sr:sr?+sr:0, ch:ch||0, hasVideo, dur };
 }
 async function peakDb(name){
-  ffLog=''; try{ await ffmpeg.run('-hide_banner','-i',name,'-vn','-af','volumedetect','-f','null','-'); }catch(_){}
+  ffLog=''; try{ await ffmpeg.exec(['-hide_banner','-i',name,'-vn','-af','volumedetect','-f','null','-']); }catch(_){}
   const m=ffLog.match(/max_volume:\s*(-?[\d.]+) dB/); return m?parseFloat(m[1]):0;
 }
 // Mirror prepare_audio() from ugc2dr3.py: -vn, normalize(<-0.5 -> 0dB), 44100, stereo, apad.
 async function makeOgg(inBytes, inName, needSeconds){
-  ffmpeg.FS('writeFile', inName, inBytes);
+  await ffmpeg.writeFile(inName, inBytes);
   const info = await probe(inName);
   const peak = await peakDb(inName);
   const target = needSeconds + 2.0;
@@ -172,16 +184,16 @@ async function makeOgg(inBytes, inName, needSeconds){
   // lossless fast path
   if(notes.length===0 && inName.toLowerCase().endsWith('.ogg') && !info.hasVideo){
     log('   audio: already DR3-ready, copied','ok');
-    try{ ffmpeg.FS('unlink', inName); }catch(_){}
+    try{ await ffmpeg.deleteFile(inName); }catch(_){}
     return inBytes;
   }
   const args=['-y','-i',inName,...out];
   if(filters.length) args.splice(3,0,'-af',filters.join(','));
   args.push('-c:a','libvorbis','-q:a','6','out.ogg');
-  await ffmpeg.run(...args);
-  const data = ffmpeg.FS('readFile','out.ogg');
+  await ffmpeg.exec(args);
+  const data = await ffmpeg.readFile('out.ogg');
   log('   audio: '+ (notes.length?notes.join('; '):'re-encoded') + (info.hasVideo?'; stripped embedded art':''),'ok');
-  try{ ffmpeg.FS('unlink', inName); ffmpeg.FS('unlink','out.ogg'); }catch(_){}
+  try{ await ffmpeg.deleteFile(inName); await ffmpeg.deleteFile('out.ogg'); }catch(_){}
   return data;
 }
 async function squarePng(bytes){
