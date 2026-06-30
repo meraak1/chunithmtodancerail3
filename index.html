@@ -127,11 +127,26 @@ const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>
     for(let i=0;i<parts.length;i++){
       setProgress(55+i*5,`ffmpeg core ${i+1}/${parts.length}\u2026`);
       const r=await fetch(abs(parts[i])); if(!r.ok) throw new Error('fetch '+r.status+' for '+parts[i]);
-      bufs.push(new Uint8Array(await r.arrayBuffer()));
+      const b=new Uint8Array(await r.arrayBuffer());
+      log(`   ${parts[i].split('/').pop()}: ${b.length} bytes`);
+      bufs.push(b);
     }
     const total=bufs.reduce((n,b)=>n+b.length,0); const whole=new Uint8Array(total);
     let off=0; for(const b of bufs){ whole.set(b,off); off+=b.length; }
+    const mg=whole.slice(0,4);
+    if(!(mg[0]===0x00&&mg[1]===0x61&&mg[2]===0x73&&mg[3]===0x6d)){
+      const head=Array.from(whole.slice(0,16)).map(x=>x.toString(16).padStart(2,'0')).join(' ');
+      throw new Error(`reassembled wasm is invalid (total ${total} bytes, expected 32129114; `
+        +`first bytes: ${head}). A .part file probably didn't upload intact - re-upload the ffmpeg/ parts.`);
+    }
+    const valid = (typeof WebAssembly.validate==='function') ? WebAssembly.validate(whole.buffer) : true;
+    log(`   wasm reassembled: ${total} bytes, magic OK, validate=${valid}`, valid?'ok':'e');
     const wasmURL=URL.createObjectURL(new Blob([whole],{type:'application/wasm'}));
+    // fetch the core JS and serve it as a same-origin blob too (matches the official
+    // working pattern: BOTH coreURL and wasmURL are blobs).
+    const coreJs=await fetch(abs('ffmpeg/ffmpeg-core.js'));
+    if(!coreJs.ok) throw new Error('fetch '+coreJs.status+' for ffmpeg-core.js');
+    const coreURL=URL.createObjectURL(new Blob([await coreJs.arrayBuffer()],{type:'text/javascript'}));
     ffmpeg = new FFmpeg();
     ffmpeg.on('log', ({ message })=>{ ffLog += message + "\n"; });
     // Do NOT pass classWorkerURL: that forces a {type:"module"} worker, which has no
