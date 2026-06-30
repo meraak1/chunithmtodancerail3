@@ -134,10 +134,11 @@ const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>
     const wasmURL=URL.createObjectURL(new Blob([whole],{type:'application/wasm'}));
     ffmpeg = new FFmpeg();
     ffmpeg.on('log', ({ message })=>{ ffLog += message + "\n"; });
-    // single-thread core (no SharedArrayBuffer) + same-origin worker/core (no cross-origin Worker).
+    // Do NOT pass classWorkerURL: that forces a {type:"module"} worker, which has no
+    // importScripts and can't load the UMD core. Omitting it makes the wrapper load
+    // 814.ffmpeg.js (sitting next to this same-origin ffmpeg.js) as a CLASSIC worker.
     await withTimeout(ffmpeg.load({
-      classWorkerURL: abs('ffmpeg/814.ffmpeg.js'),
-      coreURL:        abs('ffmpeg/ffmpeg-core.js'),
+      coreURL: abs('ffmpeg/ffmpeg-core.js'),
       wasmURL,
     }), 180000, 'ffmpeg failed to load. Make sure the ffmpeg/ folder (all parts) is uploaded.');
     log('ffmpeg.wasm ready.','ok');
