@@ -897,7 +897,7 @@ def main():
                     help="overlay a strict type-1 tap on every flick (default off)")
     ap.add_argument('--no-head-tap', action='store_true',
                     help="do NOT overlay strict taps on LN heads")
-    ap.add_argument('--offset-sign', choices=['+', '-'], default='+',
+    ap.add_argument('--offset-sign', choices=['+', '-'], default='-',
                     help="sign applied to @BGMOFS for #OFFSET (flip if desynced)")
     args = ap.parse_args()
 
