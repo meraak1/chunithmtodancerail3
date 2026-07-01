@@ -214,6 +214,26 @@ def dedupe_flicks(notes):
     for k, n in enumerate(out): n['idx'] = k
     return out, len(drop)
 
+def dedupe_bombs(notes):
+    """Delete red bomb notes (type 10) that perfectly overlap a NON-bomb note at
+    the same beat + x + width. A note hidden under a bomb is impossible to hit, so
+    that stack can't be played - the bomb is removed. Two overlapping bombs are
+    left alone. Red notes are never part of an LN, so removal is always safe.
+    O(N). Returns (notes, n_removed)."""
+    key = lambda n: (round(n['beat'], 3), round(n['x'], 3), round(n['width'], 3))
+    nonbomb_keys = {key(n) for n in notes if n['type'] != 10}
+    drop = {i for i, n in enumerate(notes) if n['type'] == 10 and key(n) in nonbomb_keys}
+    if not drop:
+        return notes, 0
+    remap, out = {}, []
+    for k, n in enumerate(notes):
+        if k in drop: continue
+        remap[k] = len(out); out.append(n)
+    for n in out:
+        n['parent'] = remap.get(n['parent'], -1) if n['parent'] >= 0 else -1
+    for k, n in enumerate(out): n['idx'] = k
+    return out, len(drop)
+
 def cmd_addmiddle(notes, m1, m2, density, indices=None):
     if density <= 0: return False, notes, "Invalid density"
     if indices is None: indices = notes_in_range(notes, m1, m2)
@@ -468,6 +488,7 @@ class Converter:
         self.ln_densified = self.ln_preserved = 0
         self.bugged_removed = 0
         self.flicks_deduped = 0
+        self.bombs_deduped = 0
 
     def _add(self, t, ichi, x, w, parent=-1, ex_head=False):
         i = len(self.notes)
@@ -562,6 +583,11 @@ class Converter:
             flicks = [i for i, n in enumerate(self.notes) if n['type'] in (9, 13, 14, 15, 16)]
             if flicks:
                 ok, self.notes, _ = cmd_forceln(self.notes, 0, 0, indices=flicks, tap_type=1)
+
+        # 3b) delete red bomb notes (type 10) stacked exactly on a non-bomb note -
+        #     that combination is impossible to hit. Runs after the tap overlays so
+        #     bombs sitting on LN heads (now carrying a tap) are caught too.
+        self.notes, self.bombs_deduped = dedupe_bombs(self.notes)
 
         # 4) delete bugged notes (before audio start / broken chains) so the chart
         #    can't crash DR3. Whole LN chains go if any link is bugged.
@@ -842,7 +868,8 @@ def convert_one(zip_path, args):
             summary.append(f"[{meta1(ch,'LEVEL','?')} -> tier {it['dr3_level']}] {fname}: "
                            f"{len(notes)} notes, offset {offset:+.3f}s, "
                            f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
-                           + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else ""))
+                           + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
+                           + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else ""))
             all_warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
         # ---- shared assets (use the hardest difficulty's metadata) ----
@@ -913,7 +940,8 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
         out_text[fname] = format_chart(build_header(ch, offset), notes)
         log.append(f"[Lv {meta1(ch,'LEVEL','?')} -> tier {it['dr3_level']}] {fname}: {len(notes)} notes, "
                    f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
-                   + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else ""))
+                   + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
+                   + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else ""))
         warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
     data_name = f"{base}.data.txt"
