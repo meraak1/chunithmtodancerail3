@@ -13,7 +13,7 @@ This is designed to be used with custom community-made charts, NOT with official
 
 Use the converter at https://meraak1.github.io/chunithmtodancerail3/
 
-Alternatively, download the ugc2dr3.py script and run it:
+Alternatively, download the ugc2dr3.py script and run it. (You need ffmpeg in PATH)
 
 ```
 py ugc2dr3.py song1.zip song2.zip
