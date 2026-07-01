@@ -1,6 +1,6 @@
 # UMIGURI To DanceRail3
 
-This is a converter that will convert UMIGURI (Chunithm) beatmaps to DanceRail3 charts. Only UMIGURI beatmaps (.ugc) are supported, but support for more formats might happen eventually.
+This is a converter that will convert UMIGURI (Chunithm) beatmaps to DanceRail3 charts. Only UMIGURI beatmaps (.ugc) are supported.
 
 To find UMIGURI beatmaps, check https://pgko.dev and the UMIGURI Discord server (https://discord.com/invite/j6mEU2hQDZ)
 
