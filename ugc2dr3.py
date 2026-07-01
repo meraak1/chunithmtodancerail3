@@ -215,14 +215,24 @@ def dedupe_flicks(notes):
     return out, len(drop)
 
 def dedupe_bombs(notes):
-    """Delete red bomb notes (type 10) that perfectly overlap a NON-bomb note at
-    the same beat + x + width. A note hidden under a bomb is impossible to hit, so
-    that stack can't be played - the bomb is removed. Two overlapping bombs are
-    left alone. Red notes are never part of an LN, so removal is always safe.
-    O(N). Returns (notes, n_removed)."""
-    key = lambda n: (round(n['beat'], 3), round(n['x'], 3), round(n['width'], 3))
-    nonbomb_keys = {key(n) for n in notes if n['type'] != 10}
-    drop = {i for i, n in enumerate(notes) if n['type'] == 10 and key(n) in nonbomb_keys}
+    """Delete red bomb notes (type 10) whose lane-span fully covers a non-bomb note
+    at the same measure: that note can't be hit without touching the bomb, so the
+    stack is impossible. A bomb that only overlaps other bombs - or that sits inside
+    a WIDER note, leaving hittable lane on either side - is left alone. Red notes are
+    never part of an LN, so removal is always safe. Returns (notes, n_removed)."""
+    from collections import defaultdict
+    buckets = defaultdict(list)                       # measure -> non-bomb lane spans
+    for n in notes:
+        if n['type'] != 10:
+            buckets[round(n['beat'], 3)].append((n['x'], n['x'] + n['width']))
+    drop = set()
+    for i, n in enumerate(notes):
+        if n['type'] != 10:
+            continue
+        r0, r1 = n['x'], n['x'] + n['width']
+        for a, b in buckets.get(round(n['beat'], 3), ()):
+            if r0 - 1e-6 <= a and b <= r1 + 1e-6:     # note span is inside the bomb span
+                drop.add(i); break
     if not drop:
         return notes, 0
     remap, out = {}, []
