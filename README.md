@@ -6,6 +6,8 @@ To find UMIGURI beatmaps, check https://pgko.dev and the UMIGURI Discord server 
 
 This converter focuses on making the converted file fun to play in DR3, rather than going for 1:1 accuracy. It outputs zip files that are ready to be imported into my DR3 Custom app for Android (https://www.youtube.com/watch?v=JSuXkqWYa4o) with no extra work required.
 
+This is designed to be used with custom community-made charts, NOT with official Chunithm charts.
+
 
 # How to use
 
