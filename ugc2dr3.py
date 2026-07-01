@@ -160,6 +160,60 @@ def find_bugged(notes, bpms, off, has_audio=True):
             bugged.add(i); continue
     return bugged
 
+def delete_bugged(notes, bpms, off):
+    """Remove bugged notes so the chart can't crash DR3. If a bugged note is part
+    of an LN, the WHOLE chain is removed (deleting one link would orphan the rest,
+    which are then bugged too). Iterates until the chart is clean. Returns
+    (clean_notes, n_removed)."""
+    removed = 0
+    for _ in range(20):
+        bugged = find_bugged(notes, bpms, off, has_audio=True)
+        if not bugged:
+            break
+        ch = build_ln_children(notes)
+        drop = set()
+        for i in bugged:
+            root, guard = i, 0                       # climb to the chain's head
+            while is_ln_child(notes, root) and 0 <= notes[root]['parent'] < len(notes):
+                root = notes[root]['parent']; guard += 1
+                if guard > len(notes): break
+            stack = [root]                           # then drop the whole chain
+            while stack:
+                x = stack.pop()
+                if x in drop: continue
+                drop.add(x); stack.extend(ch.get(x, []))
+        remap, out = {}, []
+        for k, n in enumerate(notes):
+            if k in drop: continue
+            remap[k] = len(out); out.append(n)
+        for n in out:
+            n['parent'] = remap.get(n['parent'], -1) if n['parent'] >= 0 else -1
+        for k, n in enumerate(out): n['idx'] = k
+        notes = out; removed += len(drop)
+    return notes, removed
+
+def dedupe_flicks(notes):
+    """Delete type-9 (any-direction) flicks that perfectly overlap a directional
+    flick (13/14/15/16) at the same beat + x + width. In DR3 the type-9 there is
+    redundant - the directional flick already needs a flick - so it does nothing
+    but clutter the visuals. O(N). Returns (notes, n_removed)."""
+    DIRQ = (13, 14, 15, 16)
+    key = lambda n: (round(n['beat'], 3), round(n['x'], 3), round(n['width'], 3))
+    dir_keys = {key(n) for n in notes if n['type'] in DIRQ}
+    if not dir_keys:
+        return notes, 0
+    drop = {i for i, n in enumerate(notes) if n['type'] == 9 and key(n) in dir_keys}
+    if not drop:
+        return notes, 0
+    remap, out = {}, []
+    for k, n in enumerate(notes):
+        if k in drop: continue
+        remap[k] = len(out); out.append(n)
+    for n in out:
+        n['parent'] = remap.get(n['parent'], -1) if n['parent'] >= 0 else -1
+    for k, n in enumerate(out): n['idx'] = k
+    return out, len(drop)
+
 def cmd_addmiddle(notes, m1, m2, density, indices=None):
     if density <= 0: return False, notes, "Invalid density"
     if indices is None: indices = notes_in_range(notes, m1, m2)
@@ -412,6 +466,8 @@ class Converter:
         self.warnings = []
         self.last_note_time = 0.0
         self.ln_densified = self.ln_preserved = 0
+        self.bugged_removed = 0
+        self.flicks_deduped = 0
 
     def _add(self, t, ichi, x, w, parent=-1, ex_head=False):
         i = len(self.notes)
@@ -471,6 +527,10 @@ class Converter:
                 self._add_ln(g, LN_KINDS[tc])
             # unknown tokens are silently skipped
 
+        # 0) drop type-9 flicks that perfectly overlap a directional flick (13-16);
+        #    the type-9 is redundant in DR3 and only muddies the visuals.
+        self.notes, self.flicks_deduped = dedupe_flicks(self.notes)
+
         # 1) centre notes on LNs, reusing the editor code (shape-preserving).
         #    Only densify LNs where the uniform grid would ADD centres; LNs whose
         #    Chunithm centres are already denser are left untouched so their shape
@@ -503,6 +563,11 @@ class Converter:
             if flicks:
                 ok, self.notes, _ = cmd_forceln(self.notes, 0, 0, indices=flicks, tap_type=1)
 
+        # 4) delete bugged notes (before audio start / broken chains) so the chart
+        #    can't crash DR3. Whole LN chains go if any link is bugged.
+        bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
+        self.notes, self.bugged_removed = delete_bugged(self.notes, bpms, self.offset)
+
         self._validate()
         return self.notes
 
@@ -510,13 +575,13 @@ class Converter:
         bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
         self.last_note_time = max((m2t(n['beat'], bpms, self.offset) for n in self.notes),
                                   default=0.0)
-        bugged = find_bugged(self.notes, bpms, self.offset, has_audio=True)
-        if bugged:
-            early = sum(1 for i in bugged
-                        if m2t(self.notes[i]['beat'], bpms, self.offset) < -0.001)
-            self.warnings.append(f"{len(bugged)} bugged notes "
-                                 f"({early} land before audio start) - DR3 may misbehave; "
-                                 f"try flipping --offset-sign, or fix sync")
+        if self.bugged_removed:
+            self.warnings.append(f"deleted {self.bugged_removed} bugged notes "
+                                 f"(before audio start / broken chains) to prevent a DR3 crash")
+        # safety: should be clean now
+        left = len(find_bugged(self.notes, bpms, self.offset, has_audio=True))
+        if left:
+            self.warnings.append(f"{left} bugged notes remain after cleanup (please report)")
         oob = sum(1 for n in self.notes
                   if n['x'] < -0.5 or n['x'] + n['width'] > HIGHWAY_WIDTH + 0.5)
         if oob:
@@ -776,7 +841,8 @@ def convert_one(zip_path, args):
                 format_chart(build_header(ch, offset), notes))
             summary.append(f"[{meta1(ch,'LEVEL','?')} -> tier {it['dr3_level']}] {fname}: "
                            f"{len(notes)} notes, offset {offset:+.3f}s, "
-                           f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept")
+                           f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
+                           + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else ""))
             all_warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
         # ---- shared assets (use the hardest difficulty's metadata) ----
@@ -846,7 +912,8 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
         fname = f"{base}.{it['dr3_level']}.txt"
         out_text[fname] = format_chart(build_header(ch, offset), notes)
         log.append(f"[Lv {meta1(ch,'LEVEL','?')} -> tier {it['dr3_level']}] {fname}: {len(notes)} notes, "
-                   f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept")
+                   f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
+                   + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else ""))
         warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
     data_name = f"{base}.data.txt"
