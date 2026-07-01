@@ -136,6 +136,27 @@ const wasmOK = () => (typeof WebAssembly==='object' && typeof WebAssembly.instan
 let pyodide=null, ffmpeg=null, ffLog='', filesList=[], wc=null, results=[];
 const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>r(new Error(msg)),ms))]);
 
+// ffmpeg.wasm's heap only grows and is never released between encodes, so a long
+// batch eventually traps with "memory access out of bounds". We keep the (already
+// reassembled) wasm blob around and spin up a fresh ffmpeg instance periodically and
+// after any failure, which resets that heap.
+const absURL = p => new URL(p, location.href).href;
+let ffWasmURL=null, chartsSinceReset=0;
+async function loadFfmpegInstance(){
+  const { FFmpeg } = FFmpegWASM;
+  ffmpeg = new FFmpeg();
+  ffmpeg.on('log', ({ message })=>{ ffLog += message + "\n"; });
+  await withTimeout(ffmpeg.load({ coreURL: absURL('ffmpeg/ffmpeg-core.js'), wasmURL: ffWasmURL }),
+    180000, 'ffmpeg failed to load. Make sure the ffmpeg/ folder (all parts) is uploaded.');
+  chartsSinceReset=0;
+}
+async function resetFfmpeg(reason){
+  try{ if(ffmpeg && ffmpeg.terminate) ffmpeg.terminate(); }catch(_){}
+  ffmpeg=null;
+  await loadFfmpegInstance();
+  if(reason) log('   (ffmpeg memory reset - '+reason+')','h');
+}
+
 // ---------- init ----------
 (async function init(){
   if(!wasmOK()){ wasmDisabled(); return; }   // bail early with guidance, not a raw error
@@ -174,21 +195,8 @@ const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>
     }
     const valid = (typeof WebAssembly.validate==='function') ? WebAssembly.validate(whole.buffer) : true;
     log(`   wasm reassembled: ${total} bytes, magic OK, validate=${valid}`, valid?'ok':'e');
-    const wasmURL=URL.createObjectURL(new Blob([whole],{type:'application/wasm'}));
-    // fetch the core JS and serve it as a same-origin blob too (matches the official
-    // working pattern: BOTH coreURL and wasmURL are blobs).
-    const coreJs=await fetch(abs('ffmpeg/ffmpeg-core.js'));
-    if(!coreJs.ok) throw new Error('fetch '+coreJs.status+' for ffmpeg-core.js');
-    const coreURL=URL.createObjectURL(new Blob([await coreJs.arrayBuffer()],{type:'text/javascript'}));
-    ffmpeg = new FFmpeg();
-    ffmpeg.on('log', ({ message })=>{ ffLog += message + "\n"; });
-    // Do NOT pass classWorkerURL: that forces a {type:"module"} worker, which has no
-    // importScripts and can't load the UMD core. Omitting it makes the wrapper load
-    // 814.ffmpeg.js (sitting next to this same-origin ffmpeg.js) as a CLASSIC worker.
-    await withTimeout(ffmpeg.load({
-      coreURL: abs('ffmpeg/ffmpeg-core.js'),
-      wasmURL,
-    }), 180000, 'ffmpeg failed to load. Make sure the ffmpeg/ folder (all parts) is uploaded.');
+    ffWasmURL=URL.createObjectURL(new Blob([whole],{type:'application/wasm'}));
+    await loadFfmpegInstance();
     log('ffmpeg.wasm ready.','ok');
     setProgress(100,'Ready'); setTimeout(()=>setProgress(0,'0%'),400);
     $('go').disabled=false; $('go').textContent='Convert';
@@ -275,6 +283,7 @@ $('go').addEventListener('click', async ()=>{
     const baseP = i/filesList.length*100, step=100/filesList.length;
     try{
       log('\u2500\u2500 '+f.name,'h');
+      if(chartsSinceReset>=15) await resetFfmpeg('periodic');   // pre-empt heap exhaustion
       setProgress(baseP+step*0.1,'Reading\u2026');
       const zip = await JSZip.loadAsync(await f.arrayBuffer());
 
@@ -301,9 +310,23 @@ $('go').addEventListener('click', async ()=>{
       // audio
       if(plan.audio_rel && zip.file(plan.audio_rel)){
         setProgress(baseP+step*0.5,'Processing audio\u2026');
-        const inBytes=await zip.file(plan.audio_rel).async('uint8array');
+        const srcBytes=await zip.file(plan.audio_rel).async('uint8array');
         const inName='in'+(plan.audio_rel.match(/\.[a-z0-9]+$/i)||['.mp3'])[0];
-        out.file(plan.ogg_name, await makeOgg(inBytes, inName, plan.need_seconds));
+        let ogg=null;
+        for(let attempt=0; attempt<2; attempt++){
+          try{
+            ogg=await makeOgg(srcBytes.slice(), inName, plan.need_seconds);  // copy: writeFile detaches it
+            break;
+          }catch(err){
+            const msg=String(err&&err.message||err);
+            if(attempt===0 && /out of bounds|out of memory|abort|memory|table/i.test(msg)){
+              log('   audio error ('+msg+') - resetting ffmpeg and retrying\u2026','w');
+              await resetFfmpeg('recovering after error');
+            } else throw err;
+          }
+        }
+        out.file(plan.ogg_name, ogg);
+        chartsSinceReset++;
       } else log('   WARNING: audio not found in zip','w');
 
       // jacket
@@ -324,6 +347,9 @@ $('go').addEventListener('click', async ()=>{
       $('downloads').appendChild(a); $('outPanel').style.display='block';
       log('   done \u2192 '+outName,'ok'); done++;
     }catch(e){ log('   ERROR: '+(e&&e.message||e),'e'); }
+    finally{
+      try{ pyodide.runPython(`import shutil; shutil.rmtree('/work/${i}', ignore_errors=True)`); }catch(_){}
+    }
     setProgress((i+1)/filesList.length*100);
     $('count').textContent=(i+1)+'/'+filesList.length;
   }
