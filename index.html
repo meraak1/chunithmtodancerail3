@@ -118,11 +118,27 @@ const logEl = $('log');
 function log(msg, cls){ const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=msg+"\n"; logEl.appendChild(s); logEl.scrollTop=logEl.scrollHeight; }
 function setProgress(p, text){ p=Math.max(0,Math.min(100,p)); $('fill').style.width=p+'%'; $('ptext').textContent=text||Math.round(p)+'%'; }
 
+// Shown when this browser has WebAssembly turned off (some Chromium builds, Android
+// WebViews and emulator browsers gate it behind a "JavaScript JIT" toggle; hardened
+// browsers disable it entirely). The whole converter - Python (Pyodide) and ffmpeg -
+// runs on WebAssembly, so nothing works without it.
+function wasmDisabled(){
+  log('WebAssembly is turned off in this browser, so the converter can\u2019t run.','e');
+  log('Fix: open this page\u2019s site settings and enable "JavaScript JIT" (some browsers','w');
+  log('and Android emulators call it that), then reload the page.','w');
+  log('If you can\u2019t find that setting, open the page in a standard browser such as','w');
+  log('Chrome, Firefox, Edge or Safari instead.','w');
+  $('go').textContent='WebAssembly disabled';
+  $('go').disabled=true;
+}
+const wasmOK = () => (typeof WebAssembly==='object' && typeof WebAssembly.instantiate==='function');
+
 let pyodide=null, ffmpeg=null, ffLog='', filesList=[], wc=null, results=[];
 const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>r(new Error(msg)),ms))]);
 
 // ---------- init ----------
 (async function init(){
+  if(!wasmOK()){ wasmDisabled(); return; }   // bail early with guidance, not a raw error
   try{
     setProgress(5,'Loading Python\u2026'); log('Loading Pyodide\u2026','h');
     pyodide = await loadPyodide();
@@ -176,7 +192,10 @@ const withTimeout=(p,ms,msg)=>Promise.race([p,new Promise((_,r)=>setTimeout(()=>
     log('ffmpeg.wasm ready.','ok');
     setProgress(100,'Ready'); setTimeout(()=>setProgress(0,'0%'),400);
     $('go').disabled=false; $('go').textContent='Convert';
-  }catch(e){ log('Init failed: '+e,'e'); $('go').textContent='Engine failed to load'; }
+  }catch(e){
+    if(!wasmOK() || /WebAssembly/i.test(String(e&&e.message||e))){ wasmDisabled(); }
+    else { log('Init failed: '+e,'e'); $('go').textContent='Engine failed to load'; }
+  }
 })();
 
 // ---------- file picking ----------
