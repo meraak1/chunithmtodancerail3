@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-ugc2dr3.py  --  Convert UMiGuri / Margrete Chunithm chart .zip(s) to DanceRail3 .zip(s).
-
 Usage:
     python ugc2dr3.py INPUT [INPUT ...] [-o OUTDIR] [--name BASE] [--level N]
                             [--ln-density 1/4] [--flick-tap] [--no-head-tap]
                             [--offset-sign +|-]
-
-Each INPUT is a .zip (containing a .ugc plus its audio & jacket) or a folder of
-zips. Every input zip becomes  DR_<originalname>.zip  containing the four DR3
-files. Pillow is auto-installed if missing; ffmpeg must be in PATH.
-
+                        
 The LN-centre code (cmd_addmiddle), head-tap overlay (cmd_forceln), timing math
-(m2t) and bugged-note detection (find_bugged) are lifted VERBATIM from
-dr3editor.py so behaviour matches the editor exactly.
+(m2t) and bugged-note detection (find_bugged) are reused from
+dr3editor.py so behaviour matches the editor
 """
 
 import os, re, sys, math, argparse, shutil, subprocess, glob
@@ -35,7 +29,7 @@ def ensure_package(import_name, pip_name=None):
 
 
 # ============================================================================
-#  PART 1 -- code reused verbatim from dr3editor.py (do not edit; keep in sync)
+#  PART 1 - code reused verbatim from dr3editor.py
 # ============================================================================
 HIGHWAY_WIDTH = 16.0
 OVERALL_MIN_WIDTH = 0.5
@@ -367,7 +361,7 @@ def format_chart(header, notes):
     return '\r\n'.join(lines) + '\r\n'
 
 # ============================================================================
-#  PART 2 -- UMiGuri (.ugc) parser
+#  PART 2 - UMiGuri (.ugc) parser
 # ============================================================================
 def _dec(ch):
     """Single-char lane/width code: 0-9, A-G  ->  0-16 (base 17)."""
@@ -471,7 +465,7 @@ def parse_body(body):
     return tc, None, None, body[1:]
 
 # ============================================================================
-#  PART 3 -- mapping Chunithm notes -> DR3 notes
+#  PART 3 - mapping Chunithm notes -> DR3 notes
 # ============================================================================
 LN_KINDS = {'h': (3, 11, 4), 'H': (3, 11, 4),      # holds, air-holds -> orange hold LN
             's': (5, 6, 7),  'S': (5, 6, 7)}        # slides, air-slides -> blue slide LN
@@ -624,7 +618,7 @@ class Converter:
             self.warnings.append(f"{oob} notes extend out of the 0-16 highway")
 
 # ============================================================================
-#  PART 4 -- header / data / asset output
+#  PART 4 - header / data / asset output
 # ============================================================================
 def build_header(chart, offset):
     bpms = [(chart.ichi(t), v) for t, v in chart.bpms]
@@ -791,7 +785,7 @@ def sanitize(name):
     return name or ''
 
 # ============================================================================
-#  PART 5 -- CLI  (input .zip  ->  output DR_<name>.zip)
+#  PART 5 - CLI  (input .zip  ->  output DR_<name>.zip)
 # ============================================================================
 def parse_density(s):
     s = s.strip()
