@@ -171,7 +171,10 @@ def cmd_addmiddle(notes, m1, m2, density, indices=None):
     if not starts: return False, notes, "No chain starts"
     all_remove = set(); all_new = []
     for si in starts:
-        sn = notes[si]; chain = follow_chain(notes, si)
+        sn = notes[si]
+        chain = [si]; cur = si           # walk via the already-built `ch` map (O(chain)
+        while cur in ch:                 # per start, not O(N) like follow_chain) so that
+            cur = ch[cur][-1]; chain.append(cur)   # huge charts (100k+ notes) stay fast
         if len(chain) < 2: continue
         li = chain[-1]; ln = notes[li]
         sb, eb = sn['beat'], ln['beat']
@@ -245,14 +248,13 @@ def cmd_forceln(notes, m1, m2, indices=None, tap_type=1):
         eligible.append(i)
     starts = eligible
     if not starts: return False, notes, "No eligible notes in range"
+    # precompute existing tap_type positions once (O(N)) so the dup check is O(1) per head
+    key = lambda n: (round(n['beat'], 3), round(n['x'], 3), round(n['width'], 3))
+    existing = {key(n) for n in notes if n['type'] == tap_type}
     new_taps = []
     for si in starts:
-        s = notes[si]; dup = False
-        for n in notes:
-            if n['type'] == tap_type and abs(n['beat'] - s['beat']) < 0.001 and \
-               abs(n['x'] - s['x']) < 0.001 and abs(n['width'] - s['width']) < 0.001:
-                dup = True; break
-        if dup: continue
+        s = notes[si]
+        if key(s) in existing: continue   # matches editor: check original notes only
         new_taps.append({'idx': -1, 'type': tap_type, 'beat': s['beat'], 'x': s['x'],
             'width': s['width'], 'nsc': '0', 'attr': '', 'parent': -1})
     if not new_taps: return False, notes, f"All chain starts already have type-{tap_type} taps"
@@ -514,7 +516,7 @@ class Converter:
                         if m2t(self.notes[i]['beat'], bpms, self.offset) < -0.001)
             self.warnings.append(f"{len(bugged)} bugged notes "
                                  f"({early} land before audio start) - DR3 may misbehave; "
-                                 f"try --offset-sign - or fix sync")
+                                 f"try flipping --offset-sign, or fix sync")
         oob = sum(1 for n in self.notes
                   if n['x'] < -0.5 or n['x'] + n['width'] > HIGHWAY_WIDTH + 0.5)
         if oob:
@@ -579,7 +581,7 @@ def audio_duration(path):
         return 0.0
     try:
         out = subprocess.run(['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
-                              '-of', 'csv=p=0', path], capture_output=True, text=True).stdout.strip()
+                              '-of', 'csv=p=0', path], capture_output=True, text=True, encoding='utf-8', errors='replace').stdout.strip()
         return float(out) if out else 0.0
     except Exception:
         return 0.0
@@ -592,7 +594,7 @@ def has_video_stream(path):
     try:
         out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v',
                               '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', path],
-                             capture_output=True, text=True).stdout.strip()
+                             capture_output=True, text=True, encoding='utf-8', errors='replace').stdout.strip()
         return 'video' in out
     except Exception:
         return False
@@ -605,7 +607,7 @@ def analyze_audio(path):
         try:
             out = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'a:0',
                                   '-show_entries', 'stream=sample_rate,channels',
-                                  '-of', 'csv=p=0', path], capture_output=True, text=True).stdout.strip()
+                                  '-of', 'csv=p=0', path], capture_output=True, text=True, encoding='utf-8', errors='replace').stdout.strip()
             p = out.split(',')
             sr = int(p[0]); ch = int(p[1])
         except Exception:
@@ -614,7 +616,7 @@ def analyze_audio(path):
     if shutil.which('ffmpeg'):
         try:
             r = subprocess.run(['ffmpeg', '-i', path, '-vn', '-af', 'volumedetect', '-f', 'null', '-'],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
             m = re.search(r'max_volume:\s*(-?[\d.]+) dB', r.stderr)
             if m: peak_db = float(m.group(1))
         except Exception:
@@ -806,7 +808,7 @@ def convert_one(zip_path, args):
     return out_zip, summary, all_warnings
 
 def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
-                head_tap=True, flick_tap=False, offset_sign='+'):
+                head_tap=True, flick_tap=False, offset_sign='-'):
     """Pyodide entry point. `workdir` holds the already-extracted zip contents.
     Does ALL the chart logic (identical to convert_one) and returns a JSON plan.
     Audio + jacket are handled in JS (ffmpeg.wasm / canvas), so this only resolves
@@ -898,7 +900,7 @@ def main():
     ap.add_argument('--no-head-tap', action='store_true',
                     help="do NOT overlay strict taps on LN heads")
     ap.add_argument('--offset-sign', choices=['+', '-'], default='-',
-                    help="sign applied to @BGMOFS for #OFFSET (flip if desynced)")
+                    help="sign applied to @BGMOFS for #OFFSET; default '-' (= -BGMOFS). flip if desynced")
     args = ap.parse_args()
 
     zips = expand_inputs(args.inputs)
