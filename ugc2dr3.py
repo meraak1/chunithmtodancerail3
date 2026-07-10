@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
+ugc2dr3.py  --  Convert UMiGuri / Margrete Chunithm chart .zip(s) to DanceRail3 .zip(s).
+
 Usage:
     python ugc2dr3.py INPUT [INPUT ...] [-o OUTDIR] [--name BASE] [--level N]
                             [--ln-density 1/4] [--flick-tap] [--no-head-tap]
                             [--offset-sign +|-]
-                        
+
+Each INPUT is a .zip (containing a .ugc plus its audio & jacket) or a folder of
+zips. Every input zip becomes  DR_<originalname>.zip  containing the four DR3
+files. Pillow is auto-installed if missing; ffmpeg must be in PATH.
+
 The LN-centre code (cmd_addmiddle), head-tap overlay (cmd_forceln), timing math
-(m2t) and bugged-note detection (find_bugged) are reused from
-dr3editor.py so behaviour matches the editor
+(m2t) and bugged-note detection (find_bugged) are lifted VERBATIM from
+dr3editor.py so behaviour matches the editor exactly.
 """
 
 import os, re, sys, math, argparse, shutil, subprocess, glob
@@ -29,7 +35,7 @@ def ensure_package(import_name, pip_name=None):
 
 
 # ============================================================================
-#  PART 1 - code reused verbatim from dr3editor.py
+#  PART 1 -- code reused verbatim from dr3editor.py (do not edit; keep in sync)
 # ============================================================================
 HIGHWAY_WIDTH = 16.0
 OVERALL_MIN_WIDTH = 0.5
@@ -361,7 +367,7 @@ def format_chart(header, notes):
     return '\r\n'.join(lines) + '\r\n'
 
 # ============================================================================
-#  PART 2 - UMiGuri (.ugc) parser
+#  PART 2 -- UMiGuri (.ugc) parser
 # ============================================================================
 def _dec(ch):
     """Single-char lane/width code: 0-9, A-G  ->  0-16 (base 17)."""
@@ -465,7 +471,7 @@ def parse_body(body):
     return tc, None, None, body[1:]
 
 # ============================================================================
-#  PART 3 - mapping Chunithm notes -> DR3 notes
+#  PART 3 -- mapping Chunithm notes -> DR3 notes
 # ============================================================================
 LN_KINDS = {'h': (3, 11, 4), 'H': (3, 11, 4),      # holds, air-holds -> orange hold LN
             's': (5, 6, 7),  'S': (5, 6, 7)}        # slides, air-slides -> blue slide LN
@@ -618,7 +624,7 @@ class Converter:
             self.warnings.append(f"{oob} notes extend out of the 0-16 highway")
 
 # ============================================================================
-#  PART 4 - header / data / asset output
+#  PART 4 -- header / data / asset output
 # ============================================================================
 def build_header(chart, offset):
     bpms = [(chart.ichi(t), v) for t, v in chart.bpms]
@@ -670,6 +676,48 @@ def write_data_txt_multi(items, path):
     if designers:
         lines.append("copyright:Chart by " + " / ".join(designers))
     open(path, 'w', encoding='utf-8', newline='').write('\r\n'.join(lines) + '\r\n')
+
+AUDIO_EXTS = ('.mp3', '.ogg', '.wav', '.flac', '.m4a', '.aac', '.opus', '.wma', '.aiff', '.aif')
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.gif')
+
+def _norm_name(s):
+    """Fold case and treat spaces/underscores/hyphens as interchangeable, for
+    matching filenames that drifted from what @BGM/@JACKET recorded."""
+    return re.sub(r'[\s_\-]+', '', s.lower())
+
+def find_asset(src_dir, name, exts):
+    """Resolve a file referenced by @BGM/@JACKET, tolerating filename drift
+    (space<->underscore, case, a changed extension) and finally falling back to the
+    sole file of that kind in the folder. Returns an absolute path, or '' if nothing
+    sensible matches. Chart zips almost always hold exactly one audio + one image,
+    so the fallback is safe."""
+    if not os.path.isdir(src_dir):
+        return ''
+    try:
+        files = [f for f in os.listdir(src_dir) if os.path.isfile(os.path.join(src_dir, f))]
+    except OSError:
+        return ''
+    base = os.path.basename(name) if name else ''
+    if base:
+        if base in files:                                   # 1) exact
+            return os.path.join(src_dir, base)
+        low = base.lower()                                  # 2) case-insensitive
+        for f in files:
+            if f.lower() == low:
+                return os.path.join(src_dir, f)
+        nb = _norm_name(base)                               # 3) space/underscore/hyphen + case
+        for f in files:
+            if _norm_name(f) == nb:
+                return os.path.join(src_dir, f)
+        nstem = _norm_name(os.path.splitext(base)[0])       # 4) same stem, different extension
+        cand = [f for f in files if f.lower().endswith(exts)
+                and _norm_name(os.path.splitext(f)[0]) == nstem]
+        if len(cand) == 1:
+            return os.path.join(src_dir, cand[0])
+    kind = [f for f in files if f.lower().endswith(exts)]   # 5) the only file of this kind
+    if len(kind) == 1:
+        return os.path.join(src_dir, kind[0])
+    return ''
 
 def audio_duration(path):
     if not shutil.which('ffprobe'):
@@ -785,7 +833,7 @@ def sanitize(name):
     return name or ''
 
 # ============================================================================
-#  PART 5 - CLI  (input .zip  ->  output DR_<name>.zip)
+#  PART 5 -- CLI  (input .zip  ->  output DR_<name>.zip)
 # ============================================================================
 def parse_density(s):
     s = s.strip()
@@ -881,14 +929,14 @@ def convert_one(zip_path, args):
         ch = hardest['chart']; src_dir = hardest['src_dir']
         write_data_txt_multi(items, os.path.join(stage, f"{base}.data.txt"))
 
-        bgm = meta1(ch, 'BGM'); bgm_src = os.path.join(src_dir, bgm) if bgm else ''
-        if bgm and os.path.exists(bgm_src):
+        bgm = meta1(ch, 'BGM'); bgm_src = find_asset(src_dir, bgm, AUDIO_EXTS)
+        if bgm_src:
             _, m = prepare_audio(bgm_src, os.path.join(stage, f"{base}.ogg"),
                                  need_seconds=max_need); msgs.append(m)
         else:
             msgs.append(f"audio '{bgm}' not found in the zip (skipped)")
-        jak = meta1(ch, 'JACKET'); jak_src = os.path.join(src_dir, jak) if jak else ''
-        if jak and os.path.exists(jak_src):
+        jak = meta1(ch, 'JACKET'); jak_src = find_asset(src_dir, jak, IMAGE_EXTS)
+        if jak_src:
             _, m = convert_jacket(jak_src, os.path.join(stage, f"{base}.png")); msgs.append(m)
         else:
             msgs.append(f"jacket '{jak}' not found in the zip (skipped)")
@@ -955,14 +1003,14 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
 
     hardest = max(items, key=lambda x: x['const'])
     ch, src_dir = hardest['chart'], hardest['src_dir']
-    def rel(name):
-        full = os.path.join(src_dir, name)
-        return os.path.relpath(full, workdir) if name and os.path.exists(full) else ''
+    def rel(name, exts):
+        full = find_asset(src_dir, name, exts)
+        return os.path.relpath(full, workdir) if full else ''
     return json.dumps({
         'base': base,
         'out_text': out_text,                       # {filename: text} chart files + data.txt
-        'ogg_name': f"{base}.ogg",  'audio_rel': rel(meta1(ch, 'BGM')),
-        'png_name': f"{base}.png",  'jacket_rel': rel(meta1(ch, 'JACKET')),
+        'ogg_name': f"{base}.ogg",  'audio_rel': rel(meta1(ch, 'BGM'), AUDIO_EXTS),
+        'png_name': f"{base}.png",  'jacket_rel': rel(meta1(ch, 'JACKET'), IMAGE_EXTS),
         'need_seconds': max_need,
         'log': log, 'warnings': warnings,
     }, ensure_ascii=True)
