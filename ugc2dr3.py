@@ -852,6 +852,29 @@ def find_all_in_zip(root, exts):
                 found.append(os.path.join(dirpath, fn))
     return found
 
+def select_single_bgm(items):
+    """A multi-.ugc zip normally means one song with several difficulties sharing one
+    audio file. Some packs instead ship speed/BPM variants of the same chart, each with
+    its OWN audio (e.g. 240.ugc+240.ogg, 260.ugc+260.ogg ...). Merging those would pair
+    every chart with a single audio file, so all but one would be badly desynced.
+    When the difficulties reference DIFFERENT @BGM files, keep only the highest-tier
+    chart (by @LEVEL, then @CONST) and drop the rest.
+    Returns (items, note_or_None)."""
+    if len(items) < 2:
+        return items, None
+    bgms = {(meta1(it['chart'], 'BGM') or '').strip().lower() for it in items}
+    if len(bgms) < 2:
+        return items, None                       # normal multi-difficulty zip
+    keep = max(items, key=lambda x: (x['level_int'], x['const']))
+    dropped = [it for it in items if it is not keep]
+    names = ', '.join(sorted(os.path.basename(it['path']) for it in dropped))
+    note = (f"difficulties reference different audio files "
+            f"({len(bgms)} of them) - this looks like a speed-variant pack, not one song. "
+            f"Converting only the highest-tier chart "
+            f"({os.path.basename(keep['path'])}, Lv {meta1(keep['chart'], 'LEVEL', '?')}); "
+            f"ignoring {names}")
+    return [keep], note
+
 def assign_levels(items):
     """Give each chart a UNIQUE integer DR3 tier. items: list of dicts with
     'level_int' and 'const'. Processed easiest-first so collisions push the
@@ -888,6 +911,11 @@ def convert_one(zip_path, args):
             except ValueError: const = float(lvl_int)
             items.append({'chart': ch, 'path': p, 'src_dir': os.path.dirname(p),
                           'level_int': lvl_int, 'const': const})
+
+        # speed-variant packs (each difficulty has its own audio): keep the top tier only
+        items, bgm_note = select_single_bgm(items)
+        if bgm_note:
+            msgs.append("NOTE: " + bgm_note)
 
         # shared base name (all difficulties share one stem so DR3 groups them)
         title = meta1(items[0]['chart'], 'TITLE')
@@ -972,6 +1000,9 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
         items.append({'chart': ch, 'path': p, 'src_dir': os.path.dirname(p),
                       'level_int': lvl_int, 'const': const})
 
+    # speed-variant packs (each difficulty has its own audio): keep the top tier only
+    items, bgm_note = select_single_bgm(items)
+
     title = meta1(items[0]['chart'], 'TITLE')
     base = sanitize(base_override) or sanitize(title) or 'song'
     if level_override and len(items) == 1:
@@ -982,6 +1013,8 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
     density = parse_density(ln_density)
     stage = os.path.join(workdir, '_dr3out'); os.makedirs(stage, exist_ok=True)
     out_text, log, warnings, max_need = {}, [], [], 0.0
+    if bgm_note:
+        warnings.append(bgm_note)
     for it in items:
         ch = it['chart']
         offset = ch.bgmofs * (1.0 if offset_sign == '+' else -1.0)
