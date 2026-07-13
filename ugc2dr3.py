@@ -875,21 +875,37 @@ def select_single_bgm(items):
     keep = max(items, key=lambda x: (x['level_int'], x['const']))
     dropped = [it for it in items if it is not keep]
     names = ', '.join(sorted(os.path.basename(it['path']) for it in dropped))
-    note = (f"difficulties use different audio files ({len(distinct)} of them)"
-            f"Converting only the highest-tier chart ({os.path.basename(keep['path'])},"
+    note = (f"difficulties use different audio files ({len(distinct)} of them) - this "
+            f"Converting only the "
+            f"highest-tier chart ({os.path.basename(keep['path'])}, "
             f"Lv {meta1(keep['chart'], 'LEVEL', '?')}); ignoring {names}")
     return [keep], note
 
+DR3_MIN_TIER = 1        # DR3 has no tier 0
+DR3_MAX_TIER = 25       # ...and nothing above 25
+FALLBACK_TIER = 15      # unrated charts (@LEVEL 0 / missing) land here
+
+def dr3_tier(level_int):
+    """Map a Chunithm @LEVEL onto a tier DR3 actually has."""
+    if level_int < DR3_MIN_TIER:        # 0 (or junk) = unrated -> default to 15
+        return FALLBACK_TIER
+    return min(level_int, DR3_MAX_TIER)  # nothing above 25
+
 def assign_levels(items):
-    """Give each chart a UNIQUE integer DR3 tier. items: list of dicts with
-    'level_int' and 'const'. Processed easiest-first so collisions push the
-    harder chart to the higher number. Mutates items, adding 'dr3_level'."""
-    used = set()
-    for it in sorted(items, key=lambda x: x['const']):
-        lv = it['level_int']
-        while lv in used:
-            lv += 1
-        it['dr3_level'] = lv; used.add(lv)
+    """Give each chart a UNIQUE integer DR3 tier inside the valid 1-25 range, keeping
+    difficulty order (hardest gets the highest tier). items: list of dicts with
+    'level_int' and 'const'. Mutates items, adding 'dr3_level'."""
+    order = sorted(items, key=lambda x: x['const'])          # easiest -> hardest
+    lvls, cur = [], DR3_MIN_TIER
+    for it in order:                                          # push collisions upward
+        lv = max(dr3_tier(it['level_int']), cur)
+        lvls.append(lv); cur = lv + 1
+    cap = DR3_MAX_TIER                                        # then pull back under 25,
+    for i in range(len(order) - 1, -1, -1):                   # hardest first, so the
+        lvls[i] = max(min(lvls[i], cap), DR3_MIN_TIER)        # ordering still holds
+        cap = lvls[i] - 1
+    for it, lv in zip(order, lvls):
+        it['dr3_level'] = lv
 
 def convert_one(zip_path, args):
     """Convert one input zip (which may contain SEVERAL .ugc difficulties of the
@@ -929,7 +945,7 @@ def convert_one(zip_path, args):
 
         # unique DR3 tiers (only honour --level for a single-difficulty zip)
         if args.level and len(items) == 1:
-            items[0]['dr3_level'] = int(re.sub(r'\D', '', args.level) or '1')
+            items[0]['dr3_level'] = dr3_tier(int(re.sub(r'\D', '', args.level) or '0'))
         else:
             if args.level and len(items) > 1:
                 msgs.append("note: --level ignored (zip has multiple difficulties)")
@@ -1011,7 +1027,7 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
     title = meta1(items[0]['chart'], 'TITLE')
     base = sanitize(base_override) or sanitize(title) or 'song'
     if level_override and len(items) == 1:
-        items[0]['dr3_level'] = int(re.sub(r'\D', '', level_override) or '1')
+        items[0]['dr3_level'] = dr3_tier(int(re.sub(r'\D', '', level_override) or '0'))
     else:
         assign_levels(items)
 
