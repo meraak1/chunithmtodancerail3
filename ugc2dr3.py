@@ -857,22 +857,28 @@ def select_single_bgm(items):
     audio file. Some packs instead ship speed/BPM variants of the same chart, each with
     its OWN audio (e.g. 240.ugc+240.ogg, 260.ugc+260.ogg ...). Merging those would pair
     every chart with a single audio file, so all but one would be badly desynced.
-    When the difficulties reference DIFFERENT @BGM files, keep only the highest-tier
-    chart (by @LEVEL, then @CONST) and drop the rest.
-    Returns (items, note_or_None)."""
+
+    The test is which audio file each difficulty actually RESOLVES to, not what @BGM
+    says: if the zip only holds one audio file, every chart uses it (names may simply
+    have drifted) and nothing is skipped. Only when the difficulties genuinely resolve
+    to DIFFERENT audio files do we keep the highest-tier chart (by @LEVEL, then @CONST)
+    and drop the rest. Returns (items, note_or_None)."""
     if len(items) < 2:
         return items, None
-    bgms = {(meta1(it['chart'], 'BGM') or '').strip().lower() for it in items}
-    if len(bgms) < 2:
-        return items, None                       # normal multi-difficulty zip
+    resolved = {}
+    for it in items:
+        p = find_asset(it['src_dir'], meta1(it['chart'], 'BGM'), AUDIO_EXTS)
+        resolved[id(it)] = os.path.normcase(os.path.abspath(p)) if p else ''
+    distinct = {v for v in resolved.values() if v}
+    if len(distinct) < 2:
+        return items, None                       # one shared audio -> keep every difficulty
     keep = max(items, key=lambda x: (x['level_int'], x['const']))
     dropped = [it for it in items if it is not keep]
     names = ', '.join(sorted(os.path.basename(it['path']) for it in dropped))
-    note = (f"difficulties reference different audio files "
-            f"({len(bgms)} of them) - this looks like a speed-variant pack, not one song. "
-            f"Converting only the highest-tier chart "
-            f"({os.path.basename(keep['path'])}, Lv {meta1(keep['chart'], 'LEVEL', '?')}); "
-            f"ignoring {names}")
+    note = (f"difficulties use different audio files ({len(distinct)} of them) - this "
+            f"looks like a speed-variant pack, not one song. Converting only the "
+            f"highest-tier chart ({os.path.basename(keep['path'])}, "
+            f"Lv {meta1(keep['chart'], 'LEVEL', '?')}); ignoring {names}")
     return [keep], note
 
 def assign_levels(items):
