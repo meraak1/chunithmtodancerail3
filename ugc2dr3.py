@@ -875,9 +875,8 @@ def select_single_bgm(items):
     keep = max(items, key=lambda x: (x['level_int'], x['const']))
     dropped = [it for it in items if it is not keep]
     names = ', '.join(sorted(os.path.basename(it['path']) for it in dropped))
-    note = (f"difficulties use different audio files ({len(distinct)} of them) - this "
-            f"looks like a speed-variant pack, not one song. Converting only the "
-            f"highest-tier chart ({os.path.basename(keep['path'])}, "
+    note = (f"difficulties use different audio files ({len(distinct)} of them)"
+            f"Converting only the highest-tier chart ({os.path.basename(keep['path'])},"
             f"Lv {meta1(keep['chart'], 'LEVEL', '?')}); ignoring {names}")
     return [keep], note
 
