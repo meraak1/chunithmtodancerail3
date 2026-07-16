@@ -875,7 +875,7 @@ def select_single_bgm(items):
     keep = max(items, key=lambda x: (x['level_int'], x['const']))
     dropped = [it for it in items if it is not keep]
     names = ', '.join(sorted(os.path.basename(it['path']) for it in dropped))
-    note = (f"difficulties use different audio files ({len(distinct)} of them) - this "
+    note = (f"difficulties use different audio files ({len(distinct)} of them)"
             f"Converting only the "
             f"highest-tier chart ({os.path.basename(keep['path'])}, "
             f"Lv {meta1(keep['chart'], 'LEVEL', '?')}); ignoring {names}")
@@ -891,21 +891,59 @@ def dr3_tier(level_int):
         return FALLBACK_TIER
     return min(level_int, DR3_MAX_TIER)  # nothing above 25
 
+def worldsend_tier(level_int):
+    """WORLD'S END charts (@DIFF 4) carry no real level - @LEVEL holds the star
+    rating, encoded as odd numbers 1,3,5,7,9 = 1..5 stars. Calibrate stars to tiers:
+    1->12, 2->13, 3->14, 4->15, 5->16. Anything outside 1..5 stars is treated as a
+    literal level (e.g. a hand-set LEVEL 11 -> tier 11)."""
+    star = (level_int + 1) // 2
+    if 1 <= star <= 5:
+        return 11 + star
+    return dr3_tier(level_int)
+
+def _diff_stage(ch):
+    d = meta1(ch, 'DIFF', '').strip()
+    return int(d) if d.isdigit() else 3      # no @DIFF -> treat like a normal (MASTER-rank) chart
+
 def assign_levels(items):
-    """Give each chart a UNIQUE integer DR3 tier inside the valid 1-25 range, keeping
-    difficulty order (hardest gets the highest tier). items: list of dicts with
-    'level_int' and 'const'. Mutates items, adding 'dr3_level'."""
-    order = sorted(items, key=lambda x: x['const'])          # easiest -> hardest
-    lvls, cur = [], DR3_MIN_TIER
-    for it in order:                                          # push collisions upward
-        lv = max(dr3_tier(it['level_int']), cur)
-        lvls.append(lv); cur = lv + 1
-    cap = DR3_MAX_TIER                                        # then pull back under 25,
-    for i in range(len(order) - 1, -1, -1):                   # hardest first, so the
-        lvls[i] = max(min(lvls[i], cap), DR3_MIN_TIER)        # ordering still holds
-        cap = lvls[i] - 1
-    for it, lv in zip(order, lvls):
-        it['dr3_level'] = lv
+    """Give each chart a UNIQUE integer DR3 tier in 1..25, ordered by difficulty stage
+    (@DIFF: BASIC<ADVANCED<EXPERT<MASTER<WORLD'S END<ULTIMA). Normal stages and ULTIMA
+    use their real @LEVEL; WORLD'S END uses the star calibration. Tiers are forced
+    strictly increasing along that order, so MASTER < WORLD'S END < ULTIMA always holds
+    (WE ends up above MASTER, ULTIMA above WE) even when a raw level wouldn't. Mutates
+    items, adding 'dr3_level'."""
+    def desired(it):
+        if _diff_stage(it['chart']) == 4:            # WORLD'S END
+            return worldsend_tier(it['level_int'])
+        return dr3_tier(it['level_int'])             # normal stages + ULTIMA use real level
+    order = sorted(items, key=lambda it: (_diff_stage(it['chart']), it['const'], it['level_int']))
+    tiers, cur = [], 0
+    for it in order:                                  # strictly increasing by difficulty
+        t = max(desired(it), cur + 1)
+        tiers.append(t); cur = t
+    cap = DR3_MAX_TIER                                # pull back under 25 from the hardest end
+    for i in range(len(order) - 1, -1, -1):
+        tiers[i] = min(tiers[i], cap); cap = tiers[i] - 1
+    floor = DR3_MIN_TIER                              # and keep >=1, preserving the order
+    for i in range(len(order)):
+        tiers[i] = max(tiers[i], floor); floor = tiers[i] + 1
+    for it, t in zip(order, tiers):
+        it['dr3_level'] = t
+
+def diff_label(ch):
+    """Short human label for a chart's difficulty stage + rating, e.g. 'MASTER 13+'
+    or 'WORLD\'S END 2★', for the conversion log."""
+    stage = _diff_stage(ch)
+    names = {0: 'BASIC', 1: 'ADVANCED', 2: 'EXPERT', 3: 'MASTER', 4: "WORLD'S END", 5: 'ULTIMA'}
+    lvl = meta1(ch, 'LEVEL', '?')
+    if stage == 4:                                   # show WORLD'S END rating as stars
+        try:
+            star = (int(re.sub(r'\D', '', lvl) or '0') + 1) // 2
+            lvl = f"{star}★" if 1 <= star <= 5 else lvl
+        except ValueError:
+            pass
+    nm = names.get(stage)
+    return f"{nm} {lvl}" if nm and meta1(ch, 'DIFF', '').strip().isdigit() else f"Lv {lvl}"
 
 def convert_one(zip_path, args):
     """Convert one input zip (which may contain SEVERAL .ugc difficulties of the
@@ -966,7 +1004,7 @@ def convert_one(zip_path, args):
             fname = f"{base}.{it['dr3_level']}.txt"
             open(os.path.join(stage, fname), 'w', encoding='utf-8', newline='').write(
                 format_chart(build_header(ch, offset), notes))
-            summary.append(f"[{meta1(ch,'LEVEL','?')} -> tier {it['dr3_level']}] {fname}: "
+            summary.append(f"[{diff_label(ch)} -> tier {it['dr3_level']}] {fname}: "
                            f"{len(notes)} notes, offset {offset:+.3f}s, "
                            f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                            + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
@@ -1044,7 +1082,7 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
         max_need = max(max_need, conv.last_note_time)
         fname = f"{base}.{it['dr3_level']}.txt"
         out_text[fname] = format_chart(build_header(ch, offset), notes)
-        log.append(f"[Lv {meta1(ch,'LEVEL','?')} -> tier {it['dr3_level']}] {fname}: {len(notes)} notes, "
+        log.append(f"[{diff_label(ch)} -> tier {it['dr3_level']}] {fname}: {len(notes)} notes, "
                    f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                    + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
                    + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else ""))
