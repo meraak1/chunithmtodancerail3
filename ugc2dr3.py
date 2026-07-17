@@ -244,6 +244,103 @@ def dedupe_bombs(notes):
     for k, n in enumerate(out): n['idx'] = k
     return out, len(drop)
 
+NPS_LIMIT = 250          # notes/sec the game struggles past
+NPS_MIN_RUN = 3          # consecutive quarter-note beats that must all exceed it
+
+def _drop_notes(notes, drop):
+    """Remove the note indices in `drop`, remapping parent array-indices and idx."""
+    remap, out = {}, []
+    for k, n in enumerate(notes):
+        if k in drop: continue
+        remap[k] = len(out); out.append(n)
+    for n in out:
+        n['parent'] = remap.get(n['parent'], -1) if n['parent'] >= 0 else -1
+    for k, n in enumerate(out): n['idx'] = k
+    return out
+
+def _beat_nps(notes, bpms):
+    """Per quarter-note-beat NPS, matching dr3editor's filter: bucket = floor(beat*4)/4,
+    NPS = notes_in_bucket / (60/bpm_at_bucket). Returns {bucket: nps}."""
+    import math
+    from collections import Counter
+    cnt = Counter(round(math.floor(n['beat'] * 4) / 4, 3) for n in notes)
+    def bpm_at(bk):
+        b = bpms[0]['bpm'] if bpms else 120.0
+        for e in bpms:
+            if e['beat'] <= bk: b = e['bpm']
+        return b
+    return {bk: c / (60.0 / bpm_at(bk)) for bk, c in cnt.items()}
+
+def _hot_runs(nps):
+    """[start,end) beat ranges of >= NPS_MIN_RUN consecutive quarter-beats at >= NPS_LIMIT."""
+    hot = sorted(bk for bk, v in nps.items() if v >= NPS_LIMIT)
+    runs, i = [], 0
+    while i < len(hot):
+        j = i
+        while j + 1 < len(hot) and abs(hot[j + 1] - hot[j] - 0.25) < 1e-6:
+            j += 1
+        if j - i + 1 >= NPS_MIN_RUN:
+            runs.append((hot[i], hot[j] + 0.25))
+        i = j + 1
+    return runs
+
+def reduce_stacked_nps(notes, bpms, half_density):
+    """Tame impossibly dense passages made of perfectly-stacked LNs. In every sustained
+    hot region (>= NPS_MIN_RUN consecutive beats at >= NPS_LIMIT nps):
+      A) delete HALF of the fully-redundant LNs there - an LN qualifies only if EVERY
+         one of its notes overlaps a note of another LN (same beat+x+width). Deleting
+         whole chains is safe: the head's tap is a separate note and survives.
+      B) if the region is still hot, coarsen every LN that intersects it to 1/2 centres
+         (cmd_addmiddle replaces the existing centres, halving them).
+    Returns (notes, n_lns_deleted, n_lns_coarsened). ~O(N)."""
+    from collections import Counter
+    runs = _hot_runs(_beat_nps(notes, bpms))
+    if not runs:
+        return notes, 0, 0
+
+    def chains(ns):
+        ch = build_ln_children(ns)
+        hs = [i for i in ch if not is_ln_child(ns, i)]
+        def walk(h):
+            c = [h]; cur = h
+            while cur in ch: cur = ch[cur][-1]; c.append(cur)
+            return c
+        return ch, hs, walk
+    key = lambda ns, i: (round(ns[i]['beat'], 3), round(ns[i]['x'], 3), round(ns[i]['width'], 3))
+    def hits(runlist, b0, b1):
+        return any(b0 < r1 and b1 > r0 for r0, r1 in runlist)
+
+    _, heads, walk = chains(notes)
+    allc = {h: walk(h) for h in heads}                    # walk each chain once
+    cand = [c for c in allc.values()
+            if hits(runs, notes[c[0]]['beat'], notes[c[-1]]['beat'])]
+    deleted = 0
+    if cand:
+        keycount = Counter(key(notes, i) for c in allc.values() for i in c)   # over all LN nodes
+        redundant = [c for c in cand if all(keycount[key(notes, i)] >= 2 for i in c)]
+        target = len(redundant) // 2                      # delete half -> ~halve the nps
+        drop = set()
+        for c in redundant:
+            if deleted >= target: break
+            if all(keycount[key(notes, i)] >= 2 for i in c):   # keeps every lane covered >=1
+                for i in c:
+                    keycount[key(notes, i)] -= 1; drop.add(i)
+                deleted += 1
+        if drop:
+            notes = _drop_notes(notes, drop)
+
+    coarsened = 0
+    runs2 = _hot_runs(_beat_nps(notes, bpms))
+    if runs2:
+        _, heads2, walk2 = chains(notes)
+        allc2 = {h: walk2(h) for h in heads2}
+        hot_heads = [h for h, c in allc2.items()
+                     if hits(runs2, notes[c[0]]['beat'], notes[c[-1]]['beat'])]
+        if hot_heads:
+            ok, notes, _ = cmd_addmiddle(notes, 0, 0, half_density, indices=hot_heads)
+            if ok: coarsened = len(hot_heads)
+    return notes, deleted, coarsened
+
 def cmd_addmiddle(notes, m1, m2, density, indices=None):
     if density <= 0: return False, notes, "Invalid density"
     if indices is None: indices = notes_in_range(notes, m1, m2)
@@ -499,6 +596,8 @@ class Converter:
         self.bugged_removed = 0
         self.flicks_deduped = 0
         self.bombs_deduped = 0
+        self.nps_lns_removed = 0
+        self.nps_lns_coarsened = 0
 
     def _add(self, t, ichi, x, w, parent=-1, ex_head=False):
         i = len(self.notes)
@@ -599,9 +698,15 @@ class Converter:
         #     bombs sitting on LN heads (now carrying a tap) are caught too.
         self.notes, self.bombs_deduped = dedupe_bombs(self.notes)
 
+        bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
+
+        # 3c) tame impossibly dense stacked-LN passages (halve perfectly-redundant LNs,
+        #     then coarsen survivors to 1/2 centres if still over the NPS limit).
+        self.notes, self.nps_lns_removed, self.nps_lns_coarsened = reduce_stacked_nps(
+            self.notes, bpms, parse_density('1/2'))
+
         # 4) delete bugged notes (before audio start / broken chains) so the chart
         #    can't crash DR3. Whole LN chains go if any link is bugged.
-        bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
         self.notes, self.bugged_removed = delete_bugged(self.notes, bpms, self.offset)
 
         self._validate()
@@ -1008,7 +1113,9 @@ def convert_one(zip_path, args):
                            f"{len(notes)} notes, offset {offset:+.3f}s, "
                            f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                            + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
-                           + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else ""))
+                           + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
+                           + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
+                           + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else ""))
             all_warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
         # ---- shared assets (use the hardest difficulty's metadata) ----
@@ -1085,7 +1192,9 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
         log.append(f"[{diff_label(ch)} -> tier {it['dr3_level']}] {fname}: {len(notes)} notes, "
                    f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                    + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
-                   + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else ""))
+                   + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
+                   + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
+                   + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else ""))
         warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
     data_name = f"{base}.data.txt"
