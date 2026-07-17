@@ -449,6 +449,19 @@ def cmd_forceln(notes, m1, m2, indices=None, tap_type=1):
     for i, n in enumerate(nn): n['idx'] = i
     return True, nn, f"Added {len(new_taps)} forced type-{tap_type} taps"
 
+def t2m(t, bpms, off):
+    """Time (seconds) -> measure position; exact inverse of m2t."""
+    if not bpms: return (t - off) / 2.0
+    cur_t = off
+    for i, bp in enumerate(bpms):
+        seg_start, seg_bpm = bp['beat'], bp['bpm']
+        seg_end = bpms[i + 1]['beat'] if i + 1 < len(bpms) else float('inf')
+        seg_dur = (seg_end - seg_start) * 240.0 / seg_bpm
+        if t <= cur_t + seg_dur or i == len(bpms) - 1:
+            return seg_start + (t - cur_t) * seg_bpm / 240.0
+        cur_t += seg_dur
+    return bpms[-1]['beat']
+
 def format_chart(header, notes):
     def fmt(v):
         if isinstance(v, float) and v == int(v): return str(int(v))
@@ -478,7 +491,11 @@ class UgcChart:
         self.beats = []           # list of (start_measure, num, den)
         self.bpms = []            # list of (abs_tick, value)
         self.bgmofs = 0.0
-        self.groups = []          # list of dicts: {head_tick, body, children:[(abs_tick, body)]}
+        self.groups = []          # list of dicts: {head_tick, body, children:[(abs_tick, body)], til}
+        self.tils = {}            # timeline id -> [(abs_tick, speed)]  (@TIL keyframes)
+        self.maintil = 0          # @MAINTIL
+        self.spdmod = []          # [(abs_tick, speed)]  (@SPDMOD keyframes)
+        self.has_spdfld = False   # @SPDDEF/@SPDFLD seen (unsupported, rare)
 
     # measure'tick -> absolute tick, honouring @BEAT time-signature segments
     def mt_to_tick(self, measure, tick):
@@ -512,6 +529,8 @@ def parse_ugc(path):
     in_notes = False
     cur_group = None
     bpm_lines = []
+    til_lines, spd_lines = [], []
+    cur_til = 0
     for raw in lines:
         line = raw.rstrip('\r')
         if not line.strip():
@@ -534,19 +553,34 @@ def parse_ugc(path):
                 bpm_lines.append(parts)          # resolve ticks after BEAT known
             elif tag == 'BGMOFS':
                 c.bgmofs = float(val)
+            elif tag == 'TIL':
+                til_lines.append(parts)          # @TIL id bar'tick speed
+            elif tag == 'MAINTIL':
+                try: c.maintil = int(val)
+                except ValueError: pass
+            elif tag == 'SPDMOD':
+                spd_lines.append(parts)          # @SPDMOD bar'tick speed
+            elif tag in ('SPDDEF', 'SPDFLD'):
+                c.has_spdfld = True
             else:
                 c.meta[tag] = parts[1:] if len(parts) > 1 else ['']
             continue
         # ----- note section -----
+        if line.startswith('@USETIL'):
+            pp = line.split('\t')
+            try: cur_til = int(pp[1]) if len(pp) > 1 else 0
+            except ValueError: cur_til = 0
+            continue
         m = re.match(r"^#(\d+)'(\d+):(.+)$", line)
         if m:
             at = c.mt_to_tick(int(m.group(1)), int(m.group(2)))
-            cur_group = {'tick': at, 'body': m.group(3), 'children': []}
+            cur_group = {'tick': at, 'body': m.group(3), 'children': [], 'til': cur_til}
             c.groups.append(cur_group)
             continue
         m = re.match(r"^#(\d+)>(.+)$", line)
         if m and cur_group is not None:
             # child reltick is cumulative from the head's absolute tick
+            if cur_group['til'] != cur_til: cur_group['til_mixed'] = True
             cur_group['children'].append((cur_group['tick'] + int(m.group(1)), m.group(2)))
             continue
     # resolve BPM change positions now that BEAT segments are known
@@ -557,6 +591,23 @@ def parse_ugc(path):
     if not c.bpms:
         c.bpms.append((0, 120.0))
     c.bpms.sort()
+    # resolve @TIL / @SPDMOD positions (bar'tick) the same way
+    for parts in til_lines:
+        try:
+            tid = int(parts[1])
+            mm = re.match(r"(\d+)'(\d+)", parts[2])
+            c.tils.setdefault(tid, []).append(
+                (c.mt_to_tick(int(mm.group(1)), int(mm.group(2))), float(parts[3])))
+        except (ValueError, AttributeError, IndexError):
+            pass
+    for kf in c.tils.values(): kf.sort()
+    for parts in spd_lines:
+        try:
+            mm = re.match(r"(\d+)'(\d+)", parts[1])
+            c.spdmod.append((c.mt_to_tick(int(mm.group(1)), int(mm.group(2))), float(parts[2])))
+        except (ValueError, AttributeError, IndexError):
+            pass
+    c.spdmod.sort()
     return c
 
 
@@ -582,6 +633,191 @@ def air_to_flick(extra):
     return 16 if vdir == 'D' else 15   # down / up
 
 
+# ============================================================================
+#  PART 3b -- UGC scroll-speed gimmicks (@TIL/@USETIL/@SPDMOD) -> DR3 SC + NSC
+#
+#  Both engines share the same model: scroll speed is a STEP FUNCTION over time,
+#  and a note's visual position is the time-integral of that speed from "now" to
+#  its hit time. DR3 offers three tools (semantics verified in TheGameManager.cs
+#  and TheOnpu.cs):
+#    * #SC/#SCI      - the global step function. Applies to every normal note.
+#    * simple NSC    - a constant multiplier on the SC-integrated distance.
+#    * advanced NSC  - per-note piecewise-LINEAR curve "A:B;..." mapping real time
+#                      to visual approach; keyframe time=BPMCurve(ichi-A), value=
+#                      BPMCurve(ichi-B). It BYPASSES SC entirely, and such notes
+#                      only spawn within 10s of their hit (z=300 before the first
+#                      pair). LN links have their nsc force-reset by the game, so
+#                      whole LNs can only ever follow SC.
+#
+#  Because UGC speeds are step functions, remaining-distance D(t) is piecewise
+#  linear in t -- which advanced NSC represents EXACTLY (one A:B pair per speed
+#  boundary). So: one timeline becomes the SC lane; standalone notes on other
+#  timelines get simple NSC (constant speed ratio) or exact advanced NSC curves.
+# ============================================================================
+import bisect as _bisect
+
+NSC_WINDOW_S = 9.8        # advanced-NSC notes may exist only <10s before hit
+NSC_MAX_PAIRS = 60        # cap per note (simplified with increasing tolerance)
+
+class ScrollFX:
+    """Effective scroll-speed step functions per timeline (@TIL x @SPDMOD),
+    precomputed in both measure- and time-space for fast queries."""
+    PRE = -64.0           # a boundary far before the chart; speed defaults to 1.0
+
+    def __init__(self, chart, bpms, offset):
+        self.ch, self.bpms, self.off = chart, bpms, offset
+        ids = set(chart.tils.keys()) | {0} | {g.get('til', 0) for g in chart.groups}
+        spd = [(chart.ichi(t), v) for t, v in chart.spdmod]
+        self.tl = {}
+        for tid in ids:
+            til = [(chart.ichi(t), v) for t, v in chart.tils.get(tid, [])]
+            bounds = sorted({self.PRE} | {m for m, _ in til} | {m for m, _ in spd})
+            def at(kf, m):                               # step-function lookup
+                v = 1.0
+                for mm, vv in kf:
+                    if mm <= m + 1e-9: v = vv
+                    else: break
+                return v
+            segs = [(m, at(til, m) * at(spd, m)) for m in bounds]
+            merged = [segs[0]]                           # merge equal neighbours
+            for m, v in segs[1:]:
+                if abs(v - merged[-1][1]) > 1e-9: merged.append((m, v))
+            tms = [m2t(m, bpms, offset) for m, _ in merged]
+            integ = [0.0]
+            for i in range(1, len(tms)):
+                integ.append(integ[-1] + merged[i - 1][1] * (tms[i] - tms[i - 1]))
+            self.tl[tid] = {'m': [m for m, _ in merged], 'v': [v for _, v in merged],
+                            't': tms, 'I': integ}
+
+    def _seg(self, tid, t):
+        d = self.tl[tid]
+        return max(0, _bisect.bisect_right(d['t'], t) - 1)
+
+    def integral(self, tid, t):
+        d = self.tl[tid]; i = self._seg(tid, t)
+        return d['I'][i] + d['v'][i] * (t - d['t'][i])
+
+    def remaining(self, tid, t, T):
+        """Seconds of scroll left at time t for a note hitting at time T."""
+        return self.integral(tid, T) - self.integral(tid, t)
+
+    def boundaries(self, tid, t1, t2):
+        d = self.tl[tid]
+        i = _bisect.bisect_right(d['t'], t1)
+        out = []
+        while i < len(d['t']) and d['t'][i] < t2 - 1e-9:
+            out.append(d['t'][i]); i += 1
+        return out
+
+    def equal(self, a, b):
+        da, db = self.tl[a], self.tl[b]
+        bounds = sorted(set(da['m']) | set(db['m']))
+        def at(d, m):
+            i = max(0, _bisect.bisect_right(d['m'], m + 1e-9) - 1)
+            return d['v'][i]
+        return all(abs(at(da, m) - at(db, m)) < 1e-9 for m in bounds)
+
+    def const_ratio(self, a, sc):
+        """Speed_a / speed_sc if constant over the whole chart, else None."""
+        da, ds = self.tl[a], self.tl[sc]
+        bounds = sorted(set(da['m']) | set(ds['m']))
+        r = None
+        def at(d, m):
+            i = max(0, _bisect.bisect_right(d['m'], m + 1e-9) - 1)
+            return d['v'][i]
+        for m in bounds:
+            va, vs = at(da, m), at(ds, m)
+            if abs(va) < 1e-9 and abs(vs) < 1e-9: continue
+            if abs(vs) < 1e-9: return None
+            rr = va / vs
+            if r is None: r = rr
+            elif abs(rr - r) > 1e-6: return None
+        return r
+
+    def nsc_pairs(self, tid, ichi):
+        """Exact advanced-NSC 'A:B;...' string for a note at measure `ichi` on
+        timeline `tid`, or None if it can't be expressed. Also returns pop_in:
+        True if the note should already be visible before the 10s window."""
+        T = m2t(ichi, self.bpms, self.off)
+        t_zero = m2t(0.0, self.bpms, self.off)
+        w0 = max(T - NSC_WINDOW_S, t_zero + 1e-4)   # keyframes can't precede measure 0
+        if w0 >= T: w0 = max(t_zero + 1e-4, T - 1e-3)
+        times = [w0] + self.boundaries(tid, w0, T) + [T]
+        # the game's BPMCurve clamps visual positions at measure 0, capping the
+        # representable distance. Where D(t) crosses that cap INSIDE a segment,
+        # a linear pair-to-pair interpolation would smear the kink across the
+        # screen - so insert an extra pair exactly at each crossing.
+        cap = T - t_zero
+        Ds = [self.remaining(tid, t, T) for t in times]
+        times2 = []
+        for i in range(len(times)):
+            times2.append(times[i])
+            if i + 1 < len(times):
+                da, db = Ds[i] - cap, Ds[i + 1] - cap
+                if da * db < 0:
+                    f = da / (da - db)
+                    times2.append(times[i] + f * (times[i + 1] - times[i]))
+        pts = []
+        for t in times2:
+            if pts and t - pts[-1][0] < 1e-4: continue
+            D = self.remaining(tid, t, T)
+            tgt = max(T - D, t_zero)                    # game clamps <measure 0
+            A = ichi - t2m(t, self.bpms, self.off)
+            B = ichi - t2m(tgt, self.bpms, self.off)
+            if not (math.isfinite(A) and math.isfinite(B)): return None, False
+            pts.append((t, A, B, D))
+        pop_in = pts[0][3] < 2.0                    # <2s of scroll left at window edge
+        # simplify collinear (t, B-as-time) points; A stays exact per point
+        keep = self._simplify(pts)
+        last = keep[-1]
+        keep[-1] = (last[0], 0.0, 0.0, 0.0)         # exact 0:0 at the hit moment
+        def f(v):
+            out = f"{round(v, 5):.5f}".rstrip('0').rstrip('.')
+            return out if out not in ('', '-0') else '0'
+        return ';'.join(f"{f(a)}:{f(b)}" for _, a, b, _ in keep), pop_in
+
+    def _simplify(self, pts):
+        if len(pts) <= NSC_MAX_PAIRS: return list(pts)
+        tol = 0.002
+        cur = list(pts)
+        while len(cur) > NSC_MAX_PAIRS:
+            nxt, i = [cur[0]], 1
+            while i < len(cur) - 1:
+                t0, _, _, d0 = nxt[-1]; t1, _, _, d1 = cur[i]; t2_, _, _, d2 = cur[i + 1]
+                interp = d0 + (d2 - d0) * ((t1 - t0) / (t2_ - t0)) if t2_ > t0 else d1
+                if abs(interp - d1) < tol: i += 1     # drop this point
+                else: nxt.append(cur[i]); i += 1
+                if i == len(cur) - 1: break
+            nxt.append(cur[-1]); cur = nxt; tol *= 2.0
+            if tol > 1.0: break
+        return cur
+
+def choose_sc_timeline(chart, fx):
+    """Pick the timeline that becomes DR3's global #SC lane. Priorities:
+    (1) a timeline whose standalone notes NEED SC (they'd pop in mid-screen
+        because their motion keeps them visible >10s before the hit, which
+        advanced NSC cannot represent);
+    (2) most LN content (LN bodies can only follow SC - the game resets nsc
+        on every LN link);
+    (3) most notes; (4) @MAINTIL; (5) lowest id."""
+    stats = {}
+    for g in chart.groups:
+        tid = g.get('til', 0)
+        st = stats.setdefault(tid, {'ln': 0, 'n': 0, 'need': 0})
+        st['n'] += 1
+        tc = g['body'][0] if g['body'] else '?'
+        if tc in ('h', 'H', 's', 'S'):
+            st['ln'] += len(g['children']) + 2
+        else:
+            T = m2t(chart.ichi(g['tick']), fx.bpms, fx.off)
+            if fx.remaining(tid, T - NSC_WINDOW_S, T) < 2.0 and \
+               not fx.equal(tid, chart.maintil if chart.maintil in fx.tl else 0):
+                st['need'] += 1
+    best = max(stats.keys(), key=lambda t: (
+        stats[t]['need'] > 0, stats[t]['ln'], stats[t]['n'],
+        t == chart.maintil, -t))
+    return best, stats
+
 class Converter:
     def __init__(self, chart, ln_density, head_tap, flick_tap, offset):
         self.c = chart
@@ -598,13 +834,18 @@ class Converter:
         self.bombs_deduped = 0
         self.nps_lns_removed = 0
         self.nps_lns_coarsened = 0
+        self._cur_til = 0
+        self.scs = None           # [(speed, measure)] for #SC/#SCI, None = default
+        self.nsc_simple = self.nsc_adv = 0
+        self.sc_til = None
 
     def _add(self, t, ichi, x, w, parent=-1, ex_head=False):
         i = len(self.notes)
         self.notes.append({'idx': i, 'file_idx': i, 'type': t,
             'beat': round(ichi, 5), 'x': round(float(x), 5),
             'width': round(clamp_width(float(w)), 5),
-            'nsc': '0', 'attr': '', 'parent': parent, '_ex_head': ex_head})
+            'nsc': '0', 'attr': '', 'parent': parent, '_ex_head': ex_head,
+            '_til': self._cur_til})
         return i
 
     def _path(self, group):
@@ -639,6 +880,7 @@ class Converter:
         for g in self.c.groups:
             tc, lane, width, extra = parse_body(g['body'])
             ichi = self.c.ichi(g['tick'])
+            self._cur_til = g.get('til', 0)
             if tc == 't':                              # Tap
                 self._add(1, ichi, lane or 0, width or 1)
             elif tc == 'x':                            # ExTap -> always-perfect tap
@@ -709,8 +951,63 @@ class Converter:
         #    can't crash DR3. Whole LN chains go if any link is bugged.
         self.notes, self.bugged_removed = delete_bugged(self.notes, bpms, self.offset)
 
+        # 5) scroll-speed gimmicks: translate @TIL/@USETIL/@SPDMOD into SC + NSC
+        self._apply_scrollfx(bpms)
+
         self._validate()
         return self.notes
+
+    def _apply_scrollfx(self, bpms):
+        c = self.c
+        if not c.tils and not c.spdmod:
+            return                                        # no gimmicks: keep default header
+        if c.has_spdfld:
+            self.warnings.append("chart uses @SPDDEF/@SPDFLD (v2.01 spatial speed) - unsupported, ignored")
+        fx = ScrollFX(c, bpms, self.offset)
+        sc_til, _ = choose_sc_timeline(c, fx)
+        self.sc_til = sc_til
+        # ---- emit the SC lane: effective curve of the chosen timeline ----
+        d = fx.tl[sc_til]
+        scs = [(d['v'][max(0, _bisect.bisect_right(d['m'], 1e-9) - 1)], 0.0)]
+        for m, v in zip(d['m'], d['v']):
+            if m > 1e-9 and abs(v - scs[-1][0]) > 1e-9:
+                scs.append((v, m))
+        if len(scs) > 1 or abs(scs[0][0] - 1.0) > 1e-9:
+            self.scs = scs
+        # ---- per-note NSC for standalone notes on other timelines ----
+        ch_map = build_ln_children(self.notes)
+        involved = set(ch_map.keys()) | {x for lst in ch_map.values() for x in lst}
+        ln_off, pop_ins = 0, 0
+        seen_ln_tils = set()
+        for i, n in enumerate(self.notes):
+            tid = n.get('_til')
+            if tid is None or tid not in fx.tl or tid == sc_til: continue
+            if fx.equal(tid, sc_til): continue
+            if i in involved:                             # LN link/head: engine forces SC
+                if is_ln_child(self.notes, i): continue   # count chains once, via heads
+                ln_off += 1; seen_ln_tils.add(tid); continue
+            r = fx.const_ratio(tid, sc_til)
+            if r is not None and r > 1e-9:
+                if abs(r - 1.0) > 1e-9:
+                    n['nsc'] = f"{round(r, 5):.5f}".rstrip('0').rstrip('.')
+                    self.nsc_simple += 1
+                continue
+            pairs, pop = fx.nsc_pairs(tid, n['beat'])
+            if pairs:
+                n['nsc'] = pairs; self.nsc_adv += 1
+                if pop: pop_ins += 1
+        if ln_off:
+            self.warnings.append(
+                f"{ln_off} LNs ride timeline(s) {sorted(seen_ln_tils)} but DR3 LNs can only "
+                f"follow the global SC lane (timeline {sc_til}) - their scroll motion is approximated")
+        if pop_ins:
+            self.warnings.append(
+                f"{pop_ins} notes should be visible more than 10s before their hit; DR3 spawns "
+                f"advanced-NSC notes only inside 10s, so they will pop in")
+        mixed = sum(1 for g in c.groups if g.get('til_mixed'))
+        if mixed:
+            self.warnings.append(f"{mixed} slides switch timelines mid-chain (@USETIL between joints) - "
+                                 f"DR3 cannot vary speed within one LN; using the head's timeline")
 
     def _validate(self):
         bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
@@ -731,7 +1028,7 @@ class Converter:
 # ============================================================================
 #  PART 4 -- header / data / asset output
 # ============================================================================
-def build_header(chart, offset):
+def build_header(chart, offset, scs=None):
     bpms = [(chart.ichi(t), v) for t, v in chart.bpms]
     def fnum(v):
         return f"{v:.5f}".rstrip('0').rstrip('.') if isinstance(v, float) else str(v)
@@ -740,7 +1037,13 @@ def build_header(chart, offset):
     for i, (pos, val) in enumerate(bpms):
         h.append(f"#BPM [{i}]={fnum(float(val))};")
         h.append(f"#BPMS[{i}]={fnum(float(pos))};")
-    h += ["#SCN=1;", "#SC [0]=1.0;", "#SCI[0]=0.0;"]   # TIL/soflan ignored in v1
+    if scs:                                    # translated @TIL/@SPDMOD scroll lane
+        h.append(f"#SCN={len(scs)};")
+        for i, (val, pos) in enumerate(scs):
+            h.append(f"#SC [{i}]={fnum(round(float(val), 5))};")
+            h.append(f"#SCI[{i}]={fnum(round(float(pos), 5))};")
+    else:
+        h += ["#SCN=1;", "#SC [0]=1.0;", "#SCI[0]=0.0;"]
     return h
 
 
@@ -1108,14 +1411,17 @@ def convert_one(zip_path, args):
             max_need = max(max_need, conv.last_note_time)
             fname = f"{base}.{it['dr3_level']}.txt"
             open(os.path.join(stage, fname), 'w', encoding='utf-8', newline='').write(
-                format_chart(build_header(ch, offset), notes))
+                format_chart(build_header(ch, offset, conv.scs), notes))
             summary.append(f"[{diff_label(ch)} -> tier {it['dr3_level']}] {fname}: "
                            f"{len(notes)} notes, offset {offset:+.3f}s, "
                            f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                            + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
                            + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
                            + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
-                           + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else ""))
+                           + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else "")
+                           + (f", SC {len(conv.scs)} kf (til {conv.sc_til})" if conv.scs else "")
+                           + (f", NSC {conv.nsc_adv} curves/{conv.nsc_simple} simple"
+                              if (conv.nsc_adv or conv.nsc_simple) else ""))
             all_warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
         # ---- shared assets (use the hardest difficulty's metadata) ----
@@ -1188,13 +1494,16 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
         notes = conv.convert()
         max_need = max(max_need, conv.last_note_time)
         fname = f"{base}.{it['dr3_level']}.txt"
-        out_text[fname] = format_chart(build_header(ch, offset), notes)
+        out_text[fname] = format_chart(build_header(ch, offset, conv.scs), notes)
         log.append(f"[{diff_label(ch)} -> tier {it['dr3_level']}] {fname}: {len(notes)} notes, "
                    f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                    + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
                    + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
                    + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
-                   + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else ""))
+                   + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else "")
+                   + (f", SC {len(conv.scs)} kf (til {conv.sc_til})" if conv.scs else "")
+                   + (f", NSC {conv.nsc_adv} curves/{conv.nsc_simple} simple"
+                      if (conv.nsc_adv or conv.nsc_simple) else ""))
         warnings += [f"(tier {it['dr3_level']}) {w}" for w in conv.warnings]
 
     data_name = f"{base}.data.txt"
