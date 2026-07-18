@@ -792,6 +792,171 @@ class ScrollFX:
             if tol > 1.0: break
         return cur
 
+PARADE_VIS = 2.5       # |distance| (s of scroll) considered "on screen" for parades
+PARADE_TOL = 0.06      # alignment tolerance (s) between notes sharing a window
+JUMP_M = 0.0005        # measures used for instant DSHINDO jumps (~1 tick)
+
+def _visible_intervals(fx, tid, T, t_lo, t_hi, vis=PARADE_VIS):
+    """Time intervals within [t_lo, t_hi] where a note on `tid` hitting at T has
+    |D(t)| < vis. D(t) = I(T) - I(t) is piecewise linear, so solve per segment."""
+    d = fx.tl[tid]
+    C = fx.integral(tid, T)
+    lo, hi = C - vis, C + vis
+    out = []
+    ts, Is, vs = d['t'], d['I'], d['v']
+    for i in range(len(ts)):
+        a = max(ts[i], t_lo)
+        b = min(ts[i + 1] if i + 1 < len(ts) else t_hi, t_hi)
+        if b <= a: continue
+        Ia = Is[i] + vs[i] * (a - ts[i]); Ib = Is[i] + vs[i] * (b - ts[i])
+        if abs(vs[i]) < 1e-12:
+            if lo <= Ia <= hi: out.append((a, b))
+            continue
+        # I(t) linear from Ia to Ib: t range where I in [lo, hi]
+        t1 = a + (lo - Ia) / vs[i]; t2 = a + (hi - Ia) / vs[i]
+        s0, s1 = min(t1, t2), max(t1, t2)
+        s0, s1 = max(s0, a), min(s1, b)
+        if s1 > s0 + 1e-6: out.append((s0, s1))
+    merged = []
+    for iv in sorted(out):
+        if merged and iv[0] <= merged[-1][1] + 0.02:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], iv[1]))
+        else:
+            merged.append(list(iv) if isinstance(iv, tuple) else iv)
+    return [(a, b) for a, b in merged]
+
+def _approach_matches_sc(fx, tid, sc_til, T, ivs, vis=3.5, tol=PARADE_TOL):
+    """True if, OUTSIDE the note's own parade intervals `ivs` (those get covered by
+    SC synthesis), the note's own-timeline motion equals the SC lane's whenever
+    either would put it within `vis` seconds of the line. Then the note can follow
+    SC (nsc 0): identical gameplay approach, and the parades become showable."""
+    t_zero = m2t(0.0, fx.bpms, fx.off)
+    skip = [(a - 0.02, b + 0.02) for a, b in ivs]
+    pts = {t_zero, T}
+    for x in fx.tl[tid]['t'] + fx.tl[sc_til]['t']:
+        if t_zero < x < T: pts.add(x)
+    for a, b in ivs:
+        pts.add(min(T, b + 0.05))
+    ordered = sorted(pts)
+    samples = []
+    for k, t in enumerate(ordered):
+        samples.append(t)
+        if k + 1 < len(ordered): samples.append((t + ordered[k + 1]) / 2)
+    for t in samples:
+        if any(a <= t <= b for a, b in skip): continue
+        Dk = fx.remaining(tid, t, T); Ds = fx.remaining(sc_til, t, T)
+        if (abs(Dk) < vis or abs(Ds) < vis) and abs(Dk - Ds) > tol:
+            return False
+    return True
+
+def _file_integral_fn(scs, bpms, off):
+    """Integral (in seconds) of the SC lane as the GAME will compute it from the
+    5-decimal-rounded values actually written to the file. Parade targets must use
+    this, not the raw integral: a rounded SCI under a 10000x snap shifts the
+    integral by tens of ms, and notes' dms carry that shift."""
+    r = [(round(float(sp), 5), round(float(mm), 5)) for sp, mm in scs]
+    ts = [m2t(mm, bpms, off) for _sp, mm in r]
+    I = [0.0]
+    for i in range(1, len(r)):
+        I.append(I[-1] + r[i - 1][0] * (ts[i] - ts[i - 1]))
+    def S(t):
+        i = max(0, _bisect.bisect_right(ts, t) - 1)
+        if t < ts[0]: return I[0] + (t - ts[0])          # speed 1 before first kf
+        return I[i] + r[i][0] * (t - ts[i])
+    return S
+
+def synthesize_parades(fx, sc_til, scs, parades, chart_end_t):
+    """Rebuild the SC lane so that 'orphaned' parades (notes visibly presented by
+    their own timeline earlier than the 10s advanced-NSC window allows) are shown
+    by sweeping the GLOBAL field (DSHINDO) across their chart region - the same
+    idiom native DR3 charts like mandragora use (a huge one-tick SC spike to jump,
+    then a slow drift). Windows are per source timeline (option A); if window
+    alignment fails, one continuous reverse sweep is used instead (option B).
+
+    parades: list of (w0, w1, tid, [(note_dms_s, T, ichi)...]) already vetted
+    conflict-free. Returns (new_scs, n_windows, used_fallback)."""
+    if not parades:
+        return scs, 0, False
+    S = _file_integral_fn(scs, fx.bpms, fx.off)   # SC integral as the FILE encodes it
+
+    # ---- try option A: one aligned linear-piece path per window ----
+    windows = []
+    ok_A = True
+    for (w0, w1, tid, notes) in sorted(parades):
+        # required DSHINDO (seconds) at time t: S(T_n) - D_tid(n, t); all notes
+        # in the window must agree on it within tolerance.
+        refs = []
+        for t in (w0, w1):
+            vals = [S(Tn) - fx.remaining(tid, t, Tn) for (_dms, Tn, _i) in notes]
+            if max(vals) - min(vals) > PARADE_TOL * 2:
+                ok_A = False
+            refs.append(sum(vals) / len(vals))
+        # piecewise: boundaries of the source timeline inside the window
+        mids = [t for t in fx.tl[tid]['t'] if w0 < t < w1]
+        path = []
+        _d0, T0, _i0 = notes[0]
+        for t in [w0] + mids + [w1]:
+            path.append((t, S(T0) - fx.remaining(tid, t, T0)))
+        windows.append((w0, w1, path))
+    if not ok_A:
+        # ---- option B: single continuous reverse sweep across all paraded dms ----
+        w0 = min(p[0] for p in parades); w1 = max(p[1] for p in parades)
+        alld = [S(Tn) for p in parades for (_d, Tn, _i) in p[3]]
+        top, bot = max(alld) + 1.0, min(alld) - 1.0
+        windows = [(w0, w1, [(w0, top), (w1, bot)])]
+
+    # ---- assemble the new SC keyframe list, VALUE-ANCHORED on the rounded
+    # SCI grid: choose keyframe measures first (rounded to the 5 decimals the
+    # file stores), then derive each segment speed from the rounded positions,
+    # so rounding cannot displace the parade (jump speeds run into millions).
+    def sc_speed_at(m):
+        v = scs[0][0]
+        for sp, mm in scs:
+            if mm <= m + 1e-9: v = sp
+        return v
+    r5 = lambda x: round(x, 5)
+    Sm = lambda m: S(m2t(m, fx.bpms, fx.off))
+    seq = []                                   # monotonic (measure, DSHINDO seconds)
+    def put(m, v):
+        if seq and m <= seq[-1][0] + 1e-5:
+            m = r5(seq[-1][0] + JUMP_M)        # nudge to keep a real jump width
+        seq.append((r5(m), v))
+    prev_m1 = None
+    for (w0, w1, path) in sorted(windows):
+        m0 = t2m(w0, fx.bpms, fx.off); m1 = t2m(w1, fx.bpms, fx.off)
+        if prev_m1 is None or m0 - prev_m1 > 3 * JUMP_M:
+            if prev_m1 is not None:            # rejoin original after previous window
+                put(prev_m1 + JUMP_M, Sm(r5(prev_m1 + JUMP_M)))
+            put(m0 - JUMP_M, Sm(r5(m0 - JUMP_M)))   # leave original just before this one
+        for (t, v) in path:                    # touching windows: jump directly
+            put(t2m(t, fx.bpms, fx.off), v)
+        prev_m1 = m1
+    put(prev_m1 + JUMP_M, Sm(r5(prev_m1 + JUMP_M)))
+    pts = seq
+    ev = []
+    for k in range(len(pts) - 1):
+        (ma, va), (mb, vb) = pts[k], pts[k + 1]
+        dms_ = (m2t(mb, fx.bpms, fx.off) - m2t(ma, fx.bpms, fx.off)) * 1000.0
+        ev.append((ma, (vb - va) * 1000.0 / dms_ if dms_ > 1e-9 else 0.0))
+    ev.append((pts[-1][0], sc_speed_at(pts[-1][0])))   # resume original speed
+    span = [(pts[0][0], pts[-1][0])]
+    out = []
+    for sp, mm in scs:
+        if any(a - 1e-9 <= mm <= b + 1e-9 for a, b in span):
+            continue                           # original kf inside the rebuilt span
+        out.append((sp, mm))
+    for mm, sp in ev:
+        out.append((sp, mm))
+    out.sort(key=lambda x: x[1])
+    dedup = []
+    for sp, mm in out:
+        if dedup and abs(mm - dedup[-1][1]) < 1e-6:
+            dedup[-1] = (sp, mm); continue
+        if dedup and abs(sp - dedup[-1][0]) < 1e-9:
+            continue
+        dedup.append((sp, mm))
+    return dedup, len(windows), (not ok_A)
+
 def choose_sc_timeline(chart, fx):
     """Pick the timeline that becomes DR3's global #SC lane. Priorities:
     (1) a timeline whose standalone notes NEED SC (they'd pop in mid-screen
@@ -838,6 +1003,8 @@ class Converter:
         self.scs = None           # [(speed, measure)] for #SC/#SCI, None = default
         self.nsc_simple = self.nsc_adv = 0
         self.sc_til = None
+        self.parade_windows = 0
+        self.parade_spans = []
 
     def _add(self, t, ichi, x, w, parent=-1, ex_head=False):
         i = len(self.notes)
@@ -979,10 +1146,34 @@ class Converter:
         involved = set(ch_map.keys()) | {x for lst in ch_map.values() for x in lst}
         ln_off, pop_ins = 0, 0
         seen_ln_tils = set()
+        # -- pass 1: find "orphaned parades": notes their own timeline shows on
+        #    screen EARLIER than the 10s advanced-NSC window can reach. Those can
+        #    only be displayed by sweeping the global SC field across them.
+        t_zero = m2t(0.0, bpms, self.offset)
+        chart_end_t = m2t(max((n['beat'] for n in self.notes), default=0.0), bpms, self.offset)
+        parade_notes = {}                                 # i -> (tid, T, intervals)
         for i, n in enumerate(self.notes):
             tid = n.get('_til')
             if tid is None or tid not in fx.tl or tid == sc_til: continue
             if fx.equal(tid, sc_til): continue
+            T = m2t(n['beat'], bpms, self.offset)
+            ivs = _visible_intervals(fx, tid, T, t_zero, T - NSC_WINDOW_S - 0.2)
+            ivs = [(a, b) for a, b in ivs if b - a >= 0.08]   # ignore sub-frame slivers
+            if ivs:
+                parade_notes[i] = (tid, T, ivs)
+
+        # -- pass 2: NSC assignment. Orphaned notes whose own final approach equals
+        #    the SC lane's (visible part) follow SC instead so they can parade.
+        sc_follow = set()
+        for i, n in enumerate(self.notes):
+            tid = n.get('_til')
+            if tid is None or tid not in fx.tl or tid == sc_til: continue
+            if fx.equal(tid, sc_til): continue
+            T = m2t(n['beat'], bpms, self.offset)
+            if i in parade_notes:
+                if _approach_matches_sc(fx, tid, sc_til, T, parade_notes[i][2]):
+                    sc_follow.add(i)                       # nsc stays '0'; parades via SC
+                    continue
             if i in involved:                             # LN link/head: engine forces SC
                 if is_ln_child(self.notes, i): continue   # count chains once, via heads
                 ln_off += 1; seen_ln_tils.add(tid); continue
@@ -996,6 +1187,74 @@ class Converter:
             if pairs:
                 n['nsc'] = pairs; self.nsc_adv += 1
                 if pop: pop_ins += 1
+
+        # -- pass 3: group SC-followers into parade windows and synthesize SC.
+        lost_parades = len([i for i in parade_notes if i not in sc_follow])
+        if sc_follow:
+            # SC-lane notes as (integral-at-hit, hit-time): a window conflicts only
+            # with notes still ALIVE then (not yet hit) that original SC would show.
+            base_for_S = self.scs if self.scs else [(1.0, 0.0)]
+            S_file = _file_integral_fn(base_for_S, bpms, self.offset)
+            sc_pts = []
+            for nn in self.notes:
+                tt = nn.get('_til')
+                if tt is None or tt == sc_til or (tt in fx.tl and fx.equal(tt, sc_til)):
+                    Tn = m2t(nn['beat'], bpms, self.offset)
+                    sc_pts.append((S_file(Tn), Tn))
+            sc_pts.sort()
+            sc_C = [c for c, _ in sc_pts]
+            # cluster each timeline's parade intervals (union of overlapping ivs)
+            from collections import defaultdict
+            per_til = defaultdict(list)
+            for i in sc_follow:
+                tid, T, ivs = parade_notes[i]
+                for (a, b) in ivs:
+                    per_til[tid].append((a, b, i, T))
+            parades, dropped, spans = [], 0, []
+            for tid, lst in sorted(per_til.items()):
+                lst.sort()
+                clusters = []
+                for (a, b, i, T) in lst:
+                    if clusters and a <= clusters[-1][1] + 0.05:
+                        clusters[-1][1] = max(clusters[-1][1], b)
+                        clusters[-1][2].append((i, T))
+                    else:
+                        clusters.append([a, b, [(i, T)]])
+                for (a, b, members) in clusters:
+                    if b - a < 0.05 or b + 0.05 > chart_end_t:
+                        continue
+                    Sa = [S_file(t) for t in (a, b)]
+                    lo, hi = min(Sa) - PARADE_VIS, max(Sa) + PARADE_VIS
+                    j = _bisect.bisect_left(sc_C, lo)
+                    clash = False
+                    while j < len(sc_C) and sc_C[j] <= hi:
+                        if sc_pts[j][1] > a + 0.05:        # still alive during window
+                            clash = True; break
+                        j += 1
+                    if clash or any(a < s1 - 0.005 and b > s0 + 0.005 for s0, s1 in spans):
+                        dropped += 1; continue
+                    spans.append((a, b))
+                    parades.append((a, b, tid,
+                                    [(S_file(T), T, self.notes[i]['beat'])
+                                     for (i, T) in members]))
+            if parades:
+                base_scs = self.scs if self.scs else [(1.0, 0.0)]
+                new_scs, nwin, fb = synthesize_parades(fx, sc_til, base_scs,
+                                                       parades, chart_end_t)
+                self.scs = new_scs
+                self.parade_windows = nwin
+                self.parade_spans = [(a, b) for (a, b, _t, _n) in parades]
+                self.warnings.append(
+                    ("intro/parade preview rebuilt through the global SC lane: "
+                     f"{nwin} window(s)" + (" (continuous-sweep fallback)" if fb else "")
+                     + " - previews show every note in the region, not only the original subset"))
+            if dropped:
+                self.warnings.append(f"{dropped} preview window(s) skipped (would disturb notes "
+                                     f"already on screen, or overlap another window)")
+        if lost_parades:
+            self.warnings.append(
+                f"{lost_parades} notes are presented on screen more than 10s before their hit "
+                f"in the source; DR3 cannot show them that early (their gameplay approach is kept)")
         if ln_off:
             self.warnings.append(
                 f"{ln_off} LNs ride timeline(s) {sorted(seen_ln_tils)} but DR3 LNs can only "
