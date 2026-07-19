@@ -496,6 +496,9 @@ class UgcChart:
         self.maintil = 0          # @MAINTIL
         self.spdmod = []          # [(abs_tick, speed)]  (@SPDMOD keyframes)
         self.has_spdfld = False   # @SPDDEF/@SPDFLD seen (unsupported, rare)
+        self.bpm0_dropped = 0     # duplicate measure-0 BPM entries removed
+        self.bpm0_kept = None
+        self.bpm0_differed = False
 
     # measure'tick -> absolute tick, honouring @BEAT time-signature segments
     def mt_to_tick(self, measure, tick):
@@ -591,6 +594,17 @@ def parse_ugc(path):
     if not c.bpms:
         c.bpms.append((0, 120.0))
     c.bpms.sort()
+    # DR3 treats the BPM entry at measure 0 as the special "initial" tempo. A second
+    # entry there (UMiGuri tolerates duplicates; some charts ship them) makes every
+    # note spawn stuck at the judgment line - the chart becomes unplayable. Collapse
+    # measure-0 entries into one, keeping the FASTEST. Duplicates anywhere else are
+    # harmless in DR3 and are left exactly as they are.
+    at_zero = [v for t, v in c.bpms if t == 0]
+    if len(at_zero) > 1:
+        c.bpm0_dropped = len(at_zero) - 1
+        c.bpm0_kept = max(at_zero)
+        c.bpm0_differed = (min(at_zero) != max(at_zero))
+        c.bpms = [(0, c.bpm0_kept)] + [(t, v) for t, v in c.bpms if t != 0]
     # resolve @TIL / @SPDMOD positions (bar'tick) the same way
     for parts in til_lines:
         try:
@@ -1013,6 +1027,12 @@ class Converter:
         bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
         self.last_note_time = max((m2t(n['beat'], bpms, self.offset) for n in self.notes),
                                   default=0.0)
+        if self.c.bpm0_dropped:
+            self.warnings.append(
+                f"removed {self.c.bpm0_dropped} duplicate BPM event(s) at measure 0 "
+                f"(kept {self.c.bpm0_kept:g})"
+                + (" - they disagreed, so the fastest was kept" if self.c.bpm0_differed else "")
+                + "; DR3 freezes every note if measure 0 has more than one BPM")
         if self.bugged_removed:
             self.warnings.append(f"deleted {self.bugged_removed} bugged notes "
                                  f"(before audio start / broken chains) to prevent a DR3 crash")
