@@ -214,24 +214,40 @@ def dedupe_flicks(notes):
     for k, n in enumerate(out): n['idx'] = k
     return out, len(drop)
 
-def dedupe_bombs(notes):
-    """Delete red bomb notes (type 10) whose lane-span fully covers a non-bomb note
-    at the same measure: that note can't be hit without touching the bomb, so the
-    stack is impossible. A bomb that only overlaps other bombs - or that sits inside
-    a WIDER note, leaving hittable lane on either side - is left alone. Red notes are
-    never part of an LN, so removal is always safe. Returns (notes, n_removed)."""
-    from collections import defaultdict
-    buckets = defaultdict(list)                       # measure -> non-bomb lane spans
-    for n in notes:
-        if n['type'] != 10:
-            buckets[round(n['beat'], 3)].append((n['x'], n['x'] + n['width']))
+BOMB_WINDOW_S = 0.0075      # +-7.5 ms; a red blocks the lane for this long either side
+
+def dedupe_bombs(notes, bpms, offset):
+    """Delete red bomb notes (type 10) that make another note impossible to hit.
+
+    A red is treated as a 2-D box: its lane span [x, x+width] across a time window of
+    +-BOMB_WINDOW_S around its own hit time. Ordinary notes stay 1-dimensional - a
+    lane span at a single instant. If a non-bomb note's lane span falls entirely
+    inside a red's box, that note cannot be touched without hitting the bomb, so the
+    red is removed. Reds overlapping only other reds are left alone, as is a red
+    sitting inside a WIDER note (there is still bomb-free lane to hit).
+
+    The window is measured in SECONDS via m2t, not in measures, so local BPM spikes
+    are handled correctly: notes a few thousandths of a measure apart during a
+    5000 BPM burst are only microseconds apart and are correctly seen as coincident.
+    Red notes are never part of an LN, so removal is always safe.
+    Returns (notes, n_removed)."""
+    times = [m2t(n['beat'], bpms, offset) for n in notes]
+    others = sorted((times[i], n['x'], n['x'] + n['width'])
+                    for i, n in enumerate(notes) if n['type'] != 10)
+    if not others:
+        return notes, 0
+    otimes = [o[0] for o in others]
     drop = set()
     for i, n in enumerate(notes):
         if n['type'] != 10:
             continue
         r0, r1 = n['x'], n['x'] + n['width']
-        for a, b in buckets.get(round(n['beat'], 3), ()):
-            if r0 - 1e-6 <= a and b <= r1 + 1e-6:     # note span is inside the bomb span
+        t = times[i]
+        lo = _bisect.bisect_left(otimes, t - BOMB_WINDOW_S)
+        hi = _bisect.bisect_right(otimes, t + BOMB_WINDOW_S)
+        for k in range(lo, hi):
+            _tk, a, b = others[k]
+            if r0 - 1e-6 <= a and b <= r1 + 1e-6:      # note span sits inside the bomb
                 drop.add(i); break
     if not drop:
         return notes, 0
@@ -702,8 +718,7 @@ def air_to_flick(extra):
 #
 #  Both engines share the same model: scroll speed is a STEP FUNCTION over time,
 #  and a note's visual position is the time-integral of that speed from "now" to
-#  its hit time. DR3 offers three tools (semantics verified in TheGameManager.cs
-#  and TheOnpu.cs):
+#  its hit time. DR3 offers three tools
 #    * #SC/#SCI      - the global step function. Applies to every normal note.
 #    * simple NSC    - a constant multiplier on the SC-integrated distance.
 #    * advanced NSC  - per-note piecewise-LINEAR curve "A:B;..." mapping real time
@@ -1007,9 +1022,8 @@ class Converter:
         # 3b) delete red bomb notes (type 10) stacked exactly on a non-bomb note -
         #     that combination is impossible to hit. Runs after the tap overlays so
         #     bombs sitting on LN heads (now carrying a tap) are caught too.
-        self.notes, self.bombs_deduped = dedupe_bombs(self.notes)
-
         bpms = [{'beat': self.c.ichi(t), 'bpm': v} for t, v in self.c.bpms]
+        self.notes, self.bombs_deduped = dedupe_bombs(self.notes, bpms, self.offset)
 
         # 3c) tame impossibly dense stacked-LN passages (halve perfectly-redundant LNs,
         #     then coarsen survivors to 1/2 centres if still over the NPS limit).
