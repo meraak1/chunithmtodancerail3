@@ -638,6 +638,56 @@ def parse_body(body):
 LN_KINDS = {'h': (3, 11, 4), 'H': (3, 11, 4),      # holds, air-holds -> orange hold LN
             's': (5, 6, 7),  'S': (5, 6, 7)}        # slides, air-slides -> blue slide LN
 
+CRUSH_SLAB_SPAN = 0.02      # measures; shorter than this an air-crush is a single slab
+
+def air_crush_drops(chart):
+    """Work out which AIR-CRUSH ('C') notes are decorative LINES rather than playable
+    SLABS, so the lines can be left out of the DR3 chart.
+
+    An air-crush is drawn from its head through its joints, and the trailing
+    ",density" field says how many visible slabs sit along that path:
+        density 0    -> no slabs at all: a bare guide line (pure decoration)
+        density $    -> spacing set beyond the note's own length: exactly one slab
+        density N>0  -> a slab every N ticks along the line
+        (no field)   -> older UMiGuri payload; always slab-shaped in practice
+    Only density-0 notes are decorative. The one exception: a density-0 note that is
+    short, never changes lane, and is not linked into a longer polyline is
+    indistinguishable from a slab, so it is kept.
+
+    Returns a set of indices into chart.groups that should be skipped."""
+    tpm = chart.ticks_per_beat * 4
+    info = {}
+    for i, g in enumerate(chart.groups):
+        if not g['body'] or g['body'][0] != 'C':
+            continue
+        tc, lane, width, extra = parse_body(g['body'])
+        dens = extra.split(',', 1)[1].strip() if ',' in extra else None
+        x = lane if lane is not None else 0
+        w = width if width is not None else 1
+        ex, ew, end = x, w, g['tick']
+        for ctick, cbody in sorted(g['children']):          # walk joints in time order
+            _t, cl, cw, _e = parse_body(cbody)
+            if cl is not None: ex, ew = cl, cw              # bare joints inherit position
+            end = ctick
+        info[i] = {'t0': g['tick'], 't1': end, 'x': x, 'w': w, 'ex': ex, 'ew': ew,
+                   'dens': dens, 'span': (end - g['tick']) / tpm if tpm else 0.0}
+    if not info:
+        return set()
+    starts, ends = {}, {}
+    for d in info.values():
+        starts[(d['t0'], d['x'], d['w'])] = True
+        ends[(d['t1'], d['ex'], d['ew'])] = True
+    drop = set()
+    for i, d in info.items():
+        if d['dens'] != '0':
+            continue                                        # $, N>0 and old payloads are slabs
+        linked = ends.get((d['t0'], d['x'], d['w'])) or starts.get((d['t1'], d['ex'], d['ew']))
+        static = (d['x'] == d['ex'] and d['w'] == d['ew'])
+        if not linked and static and d['span'] < CRUSH_SLAB_SPAN:
+            continue                                        # behaves exactly like a slab: keep
+        drop.add(i)
+    return drop
+
 def air_to_flick(extra):
     """extra like 'UCN','DLN','URN' -> DR3 flick type."""
     vdir = extra[0] if len(extra) >= 1 else 'U'
@@ -848,6 +898,7 @@ class Converter:
         self.bombs_deduped = 0
         self.nps_lns_removed = 0
         self.nps_lns_coarsened = 0
+        self.crush_lines_dropped = 0
         self._cur_til = 0
         self.scs = None           # [(speed, measure)] for #SC/#SCI, None = default
         self.nsc_simple = self.nsc_adv = 0
@@ -891,7 +942,11 @@ class Converter:
         self._add(end_t, *pts[-1], parent=prev)
 
     def convert(self):
-        for g in self.c.groups:
+        crush_lines = air_crush_drops(self.c)
+        for gi, g in enumerate(self.c.groups):
+            if gi in crush_lines:
+                self.crush_lines_dropped += 1
+                continue                               # decorative air-crush line
             tc, lane, width, extra = parse_body(g['body'])
             ichi = self.c.ichi(g['tick'])
             self._cur_til = g.get('til', 0)
@@ -1437,6 +1492,10 @@ def convert_one(zip_path, args):
                            f"LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                            + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
                            + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
+                   + (f", {conv.crush_lines_dropped} air-crush lines skipped"
+                      if conv.crush_lines_dropped else "")
+                           + (f", {conv.crush_lines_dropped} air-crush lines skipped"
+                              if conv.crush_lines_dropped else "")
                            + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
                            + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else "")
                            + (f", SC {len(conv.scs)} kf (til {conv.sc_til})" if conv.scs else "")
