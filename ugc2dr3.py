@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ugc2dr3.py  --  Convert UMiGuri / Margrete Chunithm chart .zip(s) to DanceRail3 .zip(s).
+ugc2dr3.py: Convert UMIGURI chart .zip(s) to DanceRail3 .zip(s).
 
 Usage:
     python ugc2dr3.py INPUT [INPUT ...] [-o OUTDIR] [--name BASE] [--level N]
@@ -35,7 +35,7 @@ def ensure_package(import_name, pip_name=None):
 
 
 # ============================================================================
-#  PART 1 -- code reused verbatim from dr3editor.py (do not edit; keep in sync)
+#  PART 1: code reused verbatim from dr3editor.py (do not edit; keep in sync)
 # ============================================================================
 HIGHWAY_WIDTH = 16.0
 OVERALL_MIN_WIDTH = 0.5
@@ -84,7 +84,7 @@ def select_densify_heads(notes, density):
     """Decide which LN heads cmd_addmiddle should re-centre.
 
     addmiddle deletes an LN's existing centre notes and lays fresh ones on a
-    uniform `density` grid. For an LN whose Chunithm centres are ALREADY denser
+    uniform `density` grid. For an LN whose UMIGURI centres are ALREADY denser
     than that grid, that would REDUCE the centre count and blockify its shape, so
     we only densify an LN when addmiddle would add MORE centres than it already
     has (this also covers start/end-only LNs, which have 0 centres and need some
@@ -202,7 +202,8 @@ def dedupe_flicks(notes):
     dir_keys = {key(n) for n in notes if n['type'] in DIRQ}
     if not dir_keys:
         return notes, 0
-    drop = {i for i, n in enumerate(notes) if n['type'] == 9 and key(n) in dir_keys}
+    drop = {i for i, n in enumerate(notes)
+            if n['type'] == 9 and key(n) in dir_keys and '_tower' not in n}
     if not drop:
         return notes, 0
     remap, out = {}, []
@@ -493,7 +494,7 @@ def format_chart(header, notes):
     return '\r\n'.join(lines) + '\r\n'
 
 # ============================================================================
-#  PART 2 -- UMiGuri (.ugc) parser
+#  PART 2: UMIGURI (.ugc) parser
 # ============================================================================
 def _dec(ch):
     """Single-char lane/width code: 0-9, A-G  ->  0-16 (base 17)."""
@@ -611,7 +612,7 @@ def parse_ugc(path):
         c.bpms.append((0, 120.0))
     c.bpms.sort()
     # DR3 treats the BPM entry at measure 0 as the special "initial" tempo. A second
-    # entry there (UMiGuri tolerates duplicates; some charts ship them) makes every
+    # entry there (UMIGURI tolerates duplicates; some charts ship them) makes every
     # note spawn stuck at the judgment line - the chart becomes unplayable. Collapse
     # measure-0 entries into one, keeping the FASTEST. Duplicates anywhere else are
     # harmless in DR3 and are left exactly as they are.
@@ -649,60 +650,149 @@ def parse_body(body):
     return tc, None, None, body[1:]
 
 # ============================================================================
-#  PART 3 -- mapping Chunithm notes -> DR3 notes
+#  PART 3: mapping UMIGURI notes -> DR3 notes
 # ============================================================================
+def sc_at_beat(scs, beat):
+    """SC (scroll-speed) multiplier active at a measure position. scs is the
+    converter\'s [(speed, measure), ...] list (ascending). Defaults to 1.0."""
+    val = 1.0
+    if scs:
+        val = scs[0][0] if scs[0][1] <= beat + 1e-9 else 1.0
+        for speed, m in scs:
+            if m <= beat + 1e-9: val = speed
+            else: break
+    return val
+
+TOWER_MAX_LAYERS = 5        # past ~5 layers the DR3 NSC tower illusion breaks down
+
+def stack_notes_3d(layers, scs):
+    """Port of dr3editor.py\'s "3D Stacker": turn a set of perfectly-overlapping
+    notes into a vertical 3D stack via a per-layer NSC illusion. layers is the
+    note dicts in stacking order (index 0 = ground). Mutates them in place.
+
+    The math is copied verbatim from the editor so the in-game look matches:
+    ground layer gets an identity curve (scaled by SC) so it scrolls like a
+    normal note; each higher layer k gets a height h, a scroll rate s=1/(1-h),
+    a hover c, a piecewise NSC curve, an outward centre shift and a width
+    scale-up for the extra perceived distance. Every apparent distance is
+    multiplied by the local SC so the stack tracks surrounding notes."""
+    import math
+    N = len(layers)
+    if N < 2:
+        return
+    C0, H0 = 0.0125, 0.30
+    HMAX = 0.30 if N == 2 else (0.35 if N == 3 else 0.40)
+    T    = 0.6  if N == 2 else 1.0
+    ref_shift = 0.25
+    SHIFT_CAL = ref_shift / (math.sqrt(1.0 / 0.7) - 1.0)
+    def _f(v):
+        t = f"{v:.5f}".rstrip('0').rstrip('.')
+        return t if t else "0"
+    SC = sc_at_beat(scs, layers[0]['beat'])
+    for k, n in enumerate(layers):
+        if k == 0:
+            n['nsc'] = f"10:{_f(round(10.0 * SC, 5))};-1:{_f(round(-SC, 5))}"
+            continue
+        frac = k / (N - 1)
+        h = HMAX * frac
+        s = 1.0 / (1.0 - h)
+        c = C0 * (h / H0)
+        kg = math.sqrt(s)
+        n['nsc'] = (f"2:{_f(round(2.0 * SC, 5))};"
+                    f"{_f(T)}:{_f(round(SC * (T * s + c), 5))};"
+                    f"0:{_f(round(SC * c, 5))}")
+        ow = n['width']; oc = n['x'] + ow / 2.0
+        nw = clamp_width(ow * (1.0 + 0.8 * (kg - 1.0)))
+        nc = oc + SHIFT_CAL * (kg - 1.0) * (oc - 8.0)
+        n['width'] = round(nw, 5)
+        n['x'] = round(nc - nw / 2.0, 5)
+
 LN_KINDS = {'h': (3, 11, 4), 'H': (3, 11, 4),      # holds, air-holds -> orange hold LN
             's': (5, 6, 7),  'S': (5, 6, 7)}        # slides, air-slides -> blue slide LN
 
-CRUSH_SLAB_SPAN = 0.02      # measures; shorter than this an air-crush is a single slab
+CRUSH_SLAB_SPAN = 0.02      # measures; shorter than this a density-0 air-crush is a slab
+CRUSH_TOWER_SPAN = 0.25     # measures; a static slab ladder longer than this is a stream,
+                            #            not a vertical tower (the 3D stack is instantaneous)
 
-def air_crush_drops(chart):
-    """Work out which AIR-CRUSH ('C') notes are decorative LINES rather than playable
-    SLABS, so the lines can be left out of the DR3 chart.
+def _crush_geo(g):
+    """Head/endpoint geometry of an AIR-CRUSH group: (x, w, ex, ew, end_tick, dens)."""
+    tc, lane, width, extra = parse_body(g['body'])
+    dens = extra.split(',', 1)[1].strip() if ',' in extra else None
+    x = lane if lane is not None else 0
+    w = width if width is not None else 1
+    ex, ew, end = x, w, g['tick']
+    for ctick, cbody in sorted(g['children']):              # walk joints in time order
+        _t, cl, cw, _e = parse_body(cbody)
+        if cl is not None: ex, ew = cl, cw                  # bare joints inherit position
+        end = ctick
+    return x, w, ex, ew, end, dens
 
-    An air-crush is drawn from its head through its joints, and the trailing
-    ",density" field says how many visible slabs sit along that path:
-        density 0    -> no slabs at all: a bare guide line (pure decoration)
-        density $    -> spacing set beyond the note's own length: exactly one slab
-        density N>0  -> a slab every N ticks along the line
-        (no field)   -> older UMiGuri payload; always slab-shaped in practice
-    Only density-0 notes are decorative. The one exception: a density-0 note that is
-    short, never changes lane, and is not linked into a longer polyline is
-    indistinguishable from a slab, so it is kept.
+def air_crush_plan(chart):
+    """Decide, for every AIR-CRUSH ('C') note, how it becomes DR3 notes.
 
-    Returns a set of indices into chart.groups that should be skipped."""
+    An air-crush is an airborne ribbon from head to endpoint; the ",interval"
+    field controls how many slabs sit ALONG it in time:
+        density 0    -> AIR-TRACE, a bare guide line: decorative, dropped
+                        (unless it is short+static+unlinked, i.e. really one slab)
+        density $    -> exactly one slab, at the start
+        density N>0  -> a slab every N ticks: duration // N + 1 slabs
+        (no field)   -> old payload, treated as a single slab
+    Each surviving slab becomes a type-9 flick. Its lane/width is interpolated
+    along the ribbon (so a moving ribbon lays its slabs down along its path).
+
+    A ladder that stays in one lane (head x/w == endpoint x/w) and is short
+    (span < CRUSH_TOWER_SPAN) reads as a vertical TOWER: all its slabs are
+    stacked at the head instant via the 3D illusion. A moving or long ladder is
+    left as its individual flicks spread across time.
+
+    Returns {group_index: {'slabs': [(tick, x, w), ...], 'tower': bool}}.
+    Dropped decorative lines are absent from the result.
+    """
     tpm = chart.ticks_per_beat * 4
-    info = {}
+    geo = {}
     for i, g in enumerate(chart.groups):
         if not g['body'] or g['body'][0] != 'C':
             continue
-        tc, lane, width, extra = parse_body(g['body'])
-        dens = extra.split(',', 1)[1].strip() if ',' in extra else None
-        x = lane if lane is not None else 0
-        w = width if width is not None else 1
-        ex, ew, end = x, w, g['tick']
-        for ctick, cbody in sorted(g['children']):          # walk joints in time order
-            _t, cl, cw, _e = parse_body(cbody)
-            if cl is not None: ex, ew = cl, cw              # bare joints inherit position
-            end = ctick
-        info[i] = {'t0': g['tick'], 't1': end, 'x': x, 'w': w, 'ex': ex, 'ew': ew,
-                   'dens': dens, 'span': (end - g['tick']) / tpm if tpm else 0.0}
-    if not info:
-        return set()
+        geo[i] = _crush_geo(g)
+    # chaining test (density-0 polylines) reuses head/endpoint coincidence
     starts, ends = {}, {}
-    for d in info.values():
-        starts[(d['t0'], d['x'], d['w'])] = True
-        ends[(d['t1'], d['ex'], d['ew'])] = True
-    drop = set()
-    for i, d in info.items():
-        if d['dens'] != '0':
-            continue                                        # $, N>0 and old payloads are slabs
-        linked = ends.get((d['t0'], d['x'], d['w'])) or starts.get((d['t1'], d['ex'], d['ew']))
-        static = (d['x'] == d['ex'] and d['w'] == d['ew'])
-        if not linked and static and d['span'] < CRUSH_SLAB_SPAN:
-            continue                                        # behaves exactly like a slab: keep
-        drop.add(i)
-    return drop
+    for i, (x, w, ex, ew, end, dens) in geo.items():
+        starts[(chart.groups[i]['tick'], x, w)] = True
+        ends[(end, ex, ew)] = True
+    plan = {}
+    for i, (x, w, ex, ew, end, dens) in geo.items():
+        g = chart.groups[i]
+        t0 = g['tick']
+        dur = end - t0
+        span = dur / tpm if tpm else 0.0
+        static = (x == ex and w == ew)
+        # --- decide slab count ---
+        if dens == '0':
+            linked = ends.get((t0, x, w)) or starts.get((end, ex, ew))
+            if linked or not static or span >= CRUSH_SLAB_SPAN:
+                continue                                    # decorative line: drop
+            n_slabs = 1                                     # short static trace = one slab
+        elif dens in (None, '$'):
+            n_slabs = 1
+        else:
+            try:
+                interval = int(dens)
+            except ValueError:
+                n_slabs = 1
+            else:
+                n_slabs = (dur // interval + 1) if interval > 0 else 1
+        n_slabs = max(1, n_slabs)
+        # --- lay the slabs down along the ribbon ---
+        slabs = []
+        for k in range(n_slabs):
+            f = 0.0 if n_slabs == 1 else k / (n_slabs - 1)
+            tk = int(round(t0 + f * dur))
+            xk = x + f * (ex - x)
+            wk = w + f * (ew - w)
+            slabs.append((tk, xk, wk))
+        tower = static and span < CRUSH_TOWER_SPAN and n_slabs >= 2
+        plan[i] = {'slabs': slabs, 'tower': tower}
+    return plan
 
 def air_to_flick(extra):
     """extra like 'UCN','DLN','URN' -> DR3 flick type."""
@@ -714,11 +804,12 @@ def air_to_flick(extra):
 
 
 # ============================================================================
-#  PART 3b -- UGC scroll-speed gimmicks (@TIL/@USETIL/@SPDMOD) -> DR3 SC + NSC
+#  PART 3b: UGC scroll-speed gimmicks (@TIL/@USETIL/@SPDMOD) -> DR3 SC + NSC
 #
 #  Both engines share the same model: scroll speed is a STEP FUNCTION over time,
 #  and a note's visual position is the time-integral of that speed from "now" to
-#  its hit time. DR3 offers three tools
+#  its hit time. DR3 offers three tools (semantics verified in TheGameManager.cs
+#  and TheOnpu.cs):
 #    * #SC/#SCI      - the global step function. Applies to every normal note.
 #    * simple NSC    - a constant multiplier on the SC-integrated distance.
 #    * advanced NSC  - per-note piecewise-LINEAR curve "A:B;..." mapping real time
@@ -729,7 +820,7 @@ def air_to_flick(extra):
 #                      whole LNs can only ever follow SC.
 #
 #  Because UGC speeds are step functions, remaining-distance D(t) is piecewise
-#  linear in t -- which advanced NSC represents EXACTLY (one A:B pair per speed
+#  linear in t, which advanced NSC represents EXACTLY (one A:B pair per speed
 #  boundary). So: one timeline becomes the SC lane; standalone notes on other
 #  timelines get simple NSC (constant speed ratio) or exact advanced NSC curves.
 # ============================================================================
@@ -914,10 +1005,54 @@ class Converter:
         self.nps_lns_removed = 0
         self.nps_lns_coarsened = 0
         self.crush_lines_dropped = 0
+        self.towers_built = 0
+        self.tower_layers = 0
+        self.towers_capped = 0
+        self.towers_grounded = 0
+        self.towers_fattened = 0
+        self.mover_added = False
         self._cur_til = 0
         self.scs = None           # [(speed, measure)] for #SC/#SCI, None = default
         self.nsc_simple = self.nsc_adv = 0
         self.sc_til = None
+
+    def _detect_towers(self, plan):
+        """Identify AIR-CRUSH towers from the crush plan. Two encodings both make
+        a vertical stack of coincident slabs:
+
+        (A) several separate 'C' groups sharing (tick, lane, width) at different
+            heights - the classic tower (each contributes one slab);
+        (B) a single 'C' group whose plan is a short, static slab ladder - its
+            N slabs stack at the head instant.
+
+        Returns {group_index: (tower_key, [slab_heights])} where slab_heights has
+        one entry per slab that group contributes, giving its rank in the stack.
+        Groups not in any tower are absent."""
+        from collections import defaultdict
+        B36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        def h36(a, b):
+            return (B36.index(a) if a in B36 else 0) * 36 + (B36.index(b) if b in B36 else 0)
+        # encoding (A): group single-slab crushes by (tick, x, w)
+        shared = defaultdict(list)                        # (tick,x,w) -> [(gi, height)]
+        out = {}
+        for gi, pl in plan.items():
+            g = self.c.groups[gi]
+            _tc, lane, width, extra = parse_body(g['body'])
+            if pl['tower']:                              # (B) single-group ladder tower
+                key = ('ladder', gi)
+                out[gi] = (key, list(range(len(pl['slabs']))))
+                continue
+            if len(pl['slabs']) == 1:                    # candidate for a shared stack
+                hh = extra[:2] if len(extra) >= 2 else '00'
+                height = h36(hh[0], hh[1]) if len(hh) == 2 else 0
+                shared[(g['tick'], lane, width)].append((gi, height))
+        for key, members in shared.items():
+            heights = sorted({h for _gi, h in members})
+            if len(heights) < 2:                         # need real vertical spread
+                continue
+            for gi, h in members:
+                out[gi] = (('shared',) + key, [h])
+        return out
 
     def _add(self, t, ichi, x, w, parent=-1, ex_head=False):
         i = len(self.notes)
@@ -957,11 +1092,11 @@ class Converter:
         self._add(end_t, *pts[-1], parent=prev)
 
     def convert(self):
-        crush_lines = air_crush_drops(self.c)
+        crush_plan = air_crush_plan(self.c)
+        tower_of = self._detect_towers(crush_plan)    # group-index -> (tower_key, [heights])
+        n_crush = sum(1 for g in self.c.groups if g['body'] and g['body'][0] == 'C')
+        self.crush_lines_dropped = n_crush - len(crush_plan)
         for gi, g in enumerate(self.c.groups):
-            if gi in crush_lines:
-                self.crush_lines_dropped += 1
-                continue                               # decorative air-crush line
             tc, lane, width, extra = parse_body(g['body'])
             ichi = self.c.ichi(g['tick'])
             self._cur_til = g.get('til', 0)
@@ -975,8 +1110,20 @@ class Converter:
                 self._add(10, ichi, lane or 0, width or 1)
             elif tc == 'a':                            # Air -> directional flick
                 self._add(air_to_flick(extra), ichi, lane or 0, width or 1)
-            elif tc == 'C':                            # Air-Crush -> flick at start
-                self._add(9, ichi, lane or 0, width or 1)
+            elif tc == 'C':                            # Air-Crush -> slab flick(s)
+                pl = crush_plan.get(gi)
+                if pl is None:
+                    pass                                   # decorative line: dropped
+                else:
+                    tw = tower_of.get(gi)
+                    for si, (stick, sx, sw) in enumerate(pl['slabs']):
+                        if tw is not None:
+                            # tower slabs stack at the head instant (coincident)
+                            ni = self._add(9, ichi, sx, sw)
+                            self.notes[ni]['_tower'] = (tw[0], tw[1][si])
+                        else:
+                            # ordinary ladder: each slab at its own time/lane
+                            ni = self._add(9, self.c.ichi(stick), sx, sw)
             elif tc in ('h', 'H'):                     # Hold / Air-Hold -> hold LN
                 self._add_ln(g, LN_KINDS[tc])
             elif tc in ('s', 'S'):                     # Slide / Air-Slide -> slide LN
@@ -989,7 +1136,7 @@ class Converter:
 
         # 1) centre notes on LNs, reusing the editor code (shape-preserving).
         #    Only densify LNs where the uniform grid would ADD centres; LNs whose
-        #    Chunithm centres are already denser are left untouched so their shape
+        #    UMIGURI centres are already denser are left untouched so their shape
         #    isn't blockified.
         density_meas = self.density
         heads, preserved = select_densify_heads(self.notes, density_meas)
@@ -997,7 +1144,7 @@ class Converter:
         if heads:
             ok, self.notes, _ = cmd_addmiddle(self.notes, 0, 0, density_meas, indices=heads)
 
-        # 2) overlay a strict tap on every LN head (Chunithm hold/slide starts are
+        # 2) overlay a strict tap on every LN head (UMIGURI hold/slide starts are
         #    judged like taps). Skip heads that already carry a coincident ExTap
         #    (the "fake-ex" pattern), which already makes them justice-critical.
         if self.head_tap:
@@ -1012,7 +1159,7 @@ class Converter:
             if heads:
                 ok, self.notes, _ = cmd_forceln(self.notes, 0, 0, indices=heads, tap_type=1)
 
-        # 3) optional strict-tap overlay on flicks (default OFF: Chunithm flicks
+        # 3) optional strict-tap overlay on flicks (default OFF: UMIGURI flicks
         #    are movement-based and chained into flick-slides).
         if self.flick_tap:
             flicks = [i for i, n in enumerate(self.notes) if n['type'] in (9, 13, 14, 15, 16)]
@@ -1037,8 +1184,158 @@ class Converter:
         # 5) scroll-speed gimmicks: translate @TIL/@USETIL/@SPDMOD into SC + NSC
         self._apply_scrollfx(bpms)
 
+        # 6) rebuild AIR-CRUSH towers as DR3 3D stacks (must follow SC: the stack
+        #    NSC curves scale by the local SC value). Groups the surviving tower
+        #    flicks by their shared key and stacks them by ascending source height.
+        self._build_towers()
+
+        # 7) force at least one mover so DR3 never zooms out (UMIGURI never does).
+        #    The head of a slide LN (type 5) can become a mover centre (type 23)
+        #    with no visual or gameplay change - confirmed safe.
+        self._ensure_mover()
+
         self._validate()
         return self.notes
+
+    def _ensure_mover(self):
+        """DR3 only allows the camera to zoom out when a chart has zero mover
+        notes; UMIGURI charts never zoom out, so guarantee a mover exists. The
+        first slide-LN head (type 5) is retyped to a mover centre (type 23),
+        which is visually and mechanically identical here. No-op if the chart
+        has no type-5 head."""
+        for n in self.notes:
+            if n['type'] == 5:
+                n['type'] = 23
+                self.mover_added = True
+                return
+
+    def _build_towers(self):
+        """Convert tagged AIR-CRUSH tower members into DR3 3D stacks using the
+        editor\'s stacker math. Runs after SC is decided so curves scale to it.
+
+        If a tower sits on top of an ordinary note at the same beat and lane (an
+        up-flick, ExTap, tap, ...), that note becomes the stack\'s GROUND layer so
+        every slab floats ABOVE it: nothing type-9 is left on the ground beside
+        the real note, and no non-type-9 note is ever lifted into the air. The
+        slab count is preserved (a 6-height tower shows 6 airborne slabs over the
+        ground note). Without such a ground note the lowest slab is the ground,
+        as before.
+
+        Air slabs are capped at TOWER_MAX_LAYERS: past ~5 the NSC illusion breaks
+        down, so a taller tower keeps that many evenly-spaced slabs (lowest + top)
+        and drops the surplus entirely."""
+        from collections import defaultdict
+        towers = defaultdict(list)
+        for n in self.notes:
+            tw = n.get('_tower')
+            if tw is not None:
+                towers[tw[0]].append((tw[1], n))          # (source_height, note)
+        # index ordinary (non-tower) notes by beat for ground-note lookup.
+        # LN-involved notes are excluded: the game force-clears NSC on LN links,
+        # so they can\'t carry the ground layer\'s identity curve.
+        ln_involved = set()
+        ch_children = build_ln_children(self.notes)
+        for parent, kids in ch_children.items():
+            ln_involved.add(parent)
+            ln_involved.update(kids)
+        ground_by_beat = defaultdict(list)
+        for gi, n in enumerate(self.notes):
+            if '_tower' not in n and gi not in ln_involved:
+                ground_by_beat[round(n['beat'], 5)].append(n)
+        built = layers_total = capped = grounded = fattened = 0
+        drop = set()
+        used_ground = set()
+        for tkey, members in towers.items():
+            if len(members) < 2:
+                continue                                  # tower lost members; skip
+            members.sort(key=lambda hn: hn[0])            # lowest slab first
+            slabs = [n for _h, n in members]
+            # look for an ordinary note under this tower to act as the ground so
+            # the slabs are erected above it (matched on the tower's lane span,
+            # taken from the lowest slab before any stacker shift is applied).
+            tx = min(n['x'] for n in slabs)
+            tw_ = max(n['x'] + n['width'] for n in slabs) - tx
+            g = None
+            for cand in ground_by_beat.get(round(slabs[0]['beat'], 5), ()):
+                if id(cand) in used_ground:
+                    continue
+                cl, cr = cand['x'], cand['x'] + cand['width']
+                if cl <= tx + 1e-6 and tx + (tw_ or 1) <= cr + 1e-6 or \
+                   tx <= cl + 1e-6 and cl + cand['width'] <= tx + (tw_ or 1) + 1e-6:
+                    g = cand; break
+            # cap TOTAL layers (ground note included) at TOWER_MAX_LAYERS: past
+            # ~5 the NSC illusion breaks down. A grounded tower therefore keeps at
+            # most TOWER_MAX_LAYERS-1 airborne slabs; a free-standing one keeps
+            # TOWER_MAX_LAYERS. Surplus slabs (evenly spaced, lowest+top kept) are
+            # dropped from the chart entirely.
+            max_slabs = TOWER_MAX_LAYERS - (1 if g is not None else 0)
+            if len(slabs) > max_slabs:
+                capped += 1
+                keep = {round(i * (len(slabs) - 1) / (max_slabs - 1))
+                        for i in range(max_slabs)}
+                for j, n in enumerate(slabs):
+                    if j not in keep:
+                        drop.add(id(n))
+                slabs = [n for j, n in enumerate(slabs) if j in keep]
+            if g is not None:
+                used_ground.add(id(g)); grounded += 1
+                layers = [g] + slabs                      # real note grounds the stack
+            else:
+                layers = slabs                            # lowest slab is the ground
+            stack_notes_3d(layers, self.scs)
+            # The outward lean can push a flick fully off the highway (no part of
+            # it in [0, HIGHWAY_WIDTH]). If so, fatten the WHOLE tower uniformly -
+            # only the type-9 flicks, never a non-flick ground - by the amount
+            # that brings the furthest-out flick 1 unit back in bounds. Fattening
+            # keeps each note's centre fixed, so the stack's shape is preserved.
+            if self._fatten_tower(layers):
+                fattened += 1
+            built += 1; layers_total += len(slabs)
+        if drop:
+            remap, kept = {}, []
+            for old_i, n in enumerate(self.notes):
+                if id(n) in drop:
+                    continue
+                remap[old_i] = len(kept)
+                kept.append(n)
+            self.notes = kept
+            for k, n in enumerate(self.notes):
+                n['parent'] = remap.get(n['parent'], -1) if n['parent'] >= 0 else -1
+                n['idx'] = k
+        self.towers_built = built
+        self.tower_layers = layers_total
+        self.towers_capped = capped
+        self.towers_grounded = grounded
+        self.towers_fattened = fattened
+
+    def _fatten_tower(self, layers):
+        """If any type-9 flick in this tower is fully off the highway (no part
+        within [0, HIGHWAY_WIDTH]), widen every type-9 flick in the tower by one
+        shared delta - the smallest that pulls the furthest-out flick 1 unit back
+        in bounds. Uses the editor\'s fatten semantics (centre kept fixed). The
+        ground note is only widened if it is itself a type-9 flick. Returns True
+        if any fattening was applied."""
+        flicks = [n for n in layers if n['type'] == 9]
+        if not flicks:
+            return False
+        need = 0.0
+        for n in flicks:
+            l, r = n['x'], n['x'] + n['width']
+            if r <= 0.0:                                   # fully off the left
+                need = max(need, 2.0 * (1.0 - r))          # bring right edge to +1
+            elif l >= HIGHWAY_WIDTH:                        # fully off the right
+                need = max(need, 2.0 * (l - (HIGHWAY_WIDTH - 1.0)))
+        if need <= 0.0:
+            return False
+        for n in flicks:
+            cx = n['x'] + n['width'] / 2.0
+            nw = round(clamp_width(n['width'] + need), 5)
+            n['width'] = nw
+            n['x'] = round(cx - nw / 2.0, 5)
+        return True
+        self.towers_built = built
+        self.tower_layers = layers_total
+        self.towers_capped = capped
 
     def _apply_scrollfx(self, bpms):
         c = self.c
@@ -1109,13 +1406,9 @@ class Converter:
         left = len(find_bugged(self.notes, bpms, self.offset, has_audio=True))
         if left:
             self.warnings.append(f"{left} bugged notes remain after cleanup (please report)")
-        oob = sum(1 for n in self.notes
-                  if n['x'] < -0.5 or n['x'] + n['width'] > HIGHWAY_WIDTH + 0.5)
-        if oob:
-            self.warnings.append(f"{oob} notes extend out of the 0-16 highway")
 
 # ============================================================================
-#  PART 4 -- header / data / asset output
+#  PART 4: header / data / asset output
 # ============================================================================
 def build_header(chart, offset, scs=None):
     bpms = [(chart.ichi(t), v) for t, v in chart.bpms]
@@ -1330,7 +1623,7 @@ def sanitize(name):
     return name or ''
 
 # ============================================================================
-#  PART 5 -- CLI  (input .zip  ->  output DR_<name>.zip)
+#  PART 5: CLI  (input .zip  ->  output DR_<name>.zip)
 # ============================================================================
 def parse_density(s):
     s = s.strip()
@@ -1372,9 +1665,8 @@ def select_single_bgm(items):
     keep = max(items, key=lambda x: (x['level_int'], x['const']))
     dropped = [it for it in items if it is not keep]
     names = ', '.join(sorted(os.path.basename(it['path']) for it in dropped))
-    note = (f"difficulties use different audio files ({len(distinct)} of them)"
-            f"Converting only the "
-            f"highest-tier chart ({os.path.basename(keep['path'])}, "
+    note = (f"difficulties use different audio files ({len(distinct)} of them). "
+            f"Converting only the highest-tier chart ({os.path.basename(keep['path'])}, "
             f"Lv {meta1(keep['chart'], 'LEVEL', '?')}); ignoring {names}")
     return [keep], note
 
@@ -1383,7 +1675,7 @@ DR3_MAX_TIER = 25       # ...and nothing above 25
 FALLBACK_TIER = 15      # unrated charts (@LEVEL 0 / missing) land here
 
 def dr3_tier(level_int):
-    """Map a Chunithm @LEVEL onto a tier DR3 actually has."""
+    """Map a UMIGURI @LEVEL onto a tier DR3 actually has."""
     if level_int < DR3_MIN_TIER:        # 0 (or junk) = unrated -> default to 15
         return FALLBACK_TIER
     return min(level_int, DR3_MAX_TIER)  # nothing above 25
@@ -1508,8 +1800,6 @@ def convert_one(zip_path, args):
                            + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
                    + (f", {conv.crush_lines_dropped} air-crush lines skipped"
                       if conv.crush_lines_dropped else "")
-                           + (f", {conv.crush_lines_dropped} air-crush lines skipped"
-                              if conv.crush_lines_dropped else "")
                            + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
                            + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else "")
                            + (f", SC {len(conv.scs)} kf (til {conv.sc_til})" if conv.scs else "")
@@ -1592,6 +1882,8 @@ def web_convert(workdir, base_override='', level_override='', ln_density='1/4',
                    f"offset {offset:+.3f}s, LNs {conv.ln_densified} densified / {conv.ln_preserved} kept"
                    + (f", {conv.flicks_deduped} dup flicks removed" if conv.flicks_deduped else "")
                    + (f", {conv.bombs_deduped} dup bombs removed" if conv.bombs_deduped else "")
+                   + (f", {conv.crush_lines_dropped} air-crush lines skipped"
+                      if conv.crush_lines_dropped else "")
                    + (f", NPS: {conv.nps_lns_removed} stacked LNs cut" if conv.nps_lns_removed else "")
                    + (f", {conv.nps_lns_coarsened} LNs thinned" if conv.nps_lns_coarsened else "")
                    + (f", SC {len(conv.scs)} kf (til {conv.sc_til})" if conv.scs else "")
@@ -1636,7 +1928,7 @@ def expand_inputs(inputs):
     return out
 
 def main():
-    ap = argparse.ArgumentParser(description="Convert UMiGuri chart .zip(s) to DanceRail3 .zip(s).")
+    ap = argparse.ArgumentParser(description="Convert UMIGURI chart .zip(s) to DanceRail3 .zip(s).")
     ap.add_argument('inputs', nargs='+', help=".zip file(s), and/or folder(s) of zips, to convert")
     ap.add_argument('-o', '--out', default=None,
                     help="directory for the output zips (default: next to each input)")
