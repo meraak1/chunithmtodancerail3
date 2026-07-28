@@ -721,39 +721,82 @@ LN_KINDS = {'h': (3, 11, 4), 'H': (3, 11, 4),      # holds, air-holds -> orange 
 CRUSH_SLAB_SPAN = 0.02      # measures; shorter than this a density-0 air-crush is a slab
 CRUSH_TOWER_SPAN = 0.25     # measures; a static slab ladder longer than this is a stream,
                             #            not a vertical tower (the 3D stack is instantaneous)
+TOWER_INSTANT_SPAN = 0.03   # measures; a height-changing ribbon this short is drawn all at
+                            #           once, so its joints stack up as a vertical tower
+
+_B36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def _b36(c):
+    return _B36.index(c) if c in _B36 else 0
+
+def crush_height(extra, new_fmt):
+    """Height of an AIR-CRUSH head/joint from the chars after its lane+width.
+
+    Two payload layouts exist and they use different units:
+      new (UMIGURI v8): 2-char height, colour, optional ",interval" - the pair is
+                        height x 10, so '30' -> 108 -> height 10.8
+      old (pre-v8):     1-char height then colour - the char IS the height
+    Returns the height in real units, or None when the joint carries no height
+    (a bare joint, which inherits the previous point's)."""
+    head = extra.split(',', 1)[0]
+    if not head:
+        return None
+    if new_fmt:
+        return (_b36(head[0]) * 36 + _b36(head[1])) / 10.0 if len(head) >= 2 else None
+    return float(_b36(head[0]))
 
 def _crush_geo(g):
-    """Head/endpoint geometry of an AIR-CRUSH group: (x, w, ex, ew, end_tick, dens)."""
+    """Joint points of an AIR-CRUSH group.
+
+    An air-crush is a ribbon through its joints; PenguinTools' converter turns
+    every consecutive pair into one segment carrying a start and end height, so
+    the joints are the ribbon's structural points. Bare joints (no lane given)
+    inherit the previous point's position and height.
+
+    Returns (points, dens) where points is [(tick, x, w, height), ...] starting
+    with the head, and dens is the ",interval" token (None when absent)."""
     tc, lane, width, extra = parse_body(g['body'])
     dens = extra.split(',', 1)[1].strip() if ',' in extra else None
+    # new layout carries 2 height chars + a colour before any comma
+    new_fmt = len(extra.split(',', 1)[0]) >= 3
     x = lane if lane is not None else 0
     w = width if width is not None else 1
-    ex, ew, end = x, w, g['tick']
-    for ctick, cbody in sorted(g['children']):              # walk joints in time order
-        _t, cl, cw, _e = parse_body(cbody)
-        if cl is not None: ex, ew = cl, cw                  # bare joints inherit position
-        end = ctick
-    return x, w, ex, ew, end, dens
+    h = crush_height(extra, new_fmt)
+    if h is None: h = 0.0
+    pts = [(g['tick'], x, w, h)]
+    for ctick, cbody in sorted(g['children']):              # joints in time order
+        _t, cl, cw, cextra = parse_body(cbody)
+        if cl is not None:
+            x, w = cl, cw                                   # bare joints inherit position
+            ch = crush_height(cextra, new_fmt)
+            if ch is not None: h = ch
+        pts.append((ctick, x, w, h))
+    return pts, dens
 
 def air_crush_plan(chart):
     """Decide, for every AIR-CRUSH ('C') note, how it becomes DR3 notes.
 
-    An air-crush is an airborne ribbon from head to endpoint; the ",interval"
-    field controls how many slabs sit ALONG it in time:
-        density 0    -> AIR-TRACE, a bare guide line: decorative, dropped
-                        (unless it is short+static+unlinked, i.e. really one slab)
-        density $    -> exactly one slab, at the start
-        density N>0  -> a slab every N ticks: duration // N + 1 slabs
-        (no field)   -> old payload, treated as a single slab
-    Each surviving slab becomes a type-9 flick. Its lane/width is interpolated
-    along the ribbon (so a moving ribbon lays its slabs down along its path).
+    An air-crush is an airborne ribbon drawn through its joints. How many slabs
+    it shows depends on the ",interval" field and on whether it changes height:
 
-    A ladder that stays in one lane (head x/w == endpoint x/w) and is short
-    (span < CRUSH_TOWER_SPAN) reads as a vertical TOWER: all its slabs are
-    stacked at the head instant via the 3D illusion. A moving or long ladder is
-    left as its individual flicks spread across time.
+      density 0    -> AIR-TRACE, a bare guide line: decorative, dropped
+                      (unless short + static + unlinked, i.e. really one slab)
+      density N>0  -> a slab every N ticks: duration // N + 1 slabs
+      density $ / no field:
+          height varies across the joints -> the ribbon is a stack, and each
+              JOINT POINT is one slab (head + children), with lane, width and
+              height interpolated between head and endpoint
+          height constant -> a flat bar: one slab
 
-    Returns {group_index: {'slabs': [(tick, x, w), ...], 'tower': bool}}.
+    Each slab becomes a type-9 flick. A ribbon whose slabs are stacked at
+    essentially one instant is a vertical TOWER, rendered with the 3D illusion:
+      * a static slab ladder (interval-driven) shorter than CRUSH_TOWER_SPAN
+      * a height-changing ribbon shorter than TOWER_INSTANT_SPAN
+    The stack may lean (centre drifting) or taper (width changing) exactly as the
+    source does, because both are carried by the interpolation. A ribbon that
+    genuinely advances in time is left as separate flicks along its path.
+
+    Returns {group_index: {'slabs': [(tick, x, w, height), ...], 'tower': bool}}.
     Dropped decorative lines are absent from the result.
     """
     tpm = chart.ticks_per_beat * 4
@@ -764,41 +807,41 @@ def air_crush_plan(chart):
         geo[i] = _crush_geo(g)
     # chaining test (density-0 polylines) reuses head/endpoint coincidence
     starts, ends = {}, {}
-    for i, (x, w, ex, ew, end, dens) in geo.items():
-        starts[(chart.groups[i]['tick'], x, w)] = True
-        ends[(end, ex, ew)] = True
+    for i, (pts, dens) in geo.items():
+        starts[(pts[0][0], pts[0][1], pts[0][2])] = True
+        ends[(pts[-1][0], pts[-1][1], pts[-1][2])] = True
     plan = {}
-    for i, (x, w, ex, ew, end, dens) in geo.items():
-        g = chart.groups[i]
-        t0 = g['tick']
+    for i, (pts, dens) in geo.items():
+        t0, x, w, h = pts[0]
+        end, ex, ew, eh = pts[-1]
         dur = end - t0
         span = dur / tpm if tpm else 0.0
         static = (x == ex and w == ew)
-        # --- decide slab count ---
+        moves_h = any(abs(pt[3] - h) > 1e-9 for pt in pts)
+        n_slabs = 1
+        tower = False
         if dens == '0':
             linked = ends.get((t0, x, w)) or starts.get((end, ex, ew))
             if linked or not static or span >= CRUSH_SLAB_SPAN:
                 continue                                    # decorative line: drop
-            n_slabs = 1                                     # short static trace = one slab
-        elif dens in (None, '$'):
-            n_slabs = 1
-        else:
+        elif dens not in (None, '$'):
             try:
                 interval = int(dens)
             except ValueError:
-                n_slabs = 1
-            else:
-                n_slabs = (dur // interval + 1) if interval > 0 else 1
-        n_slabs = max(1, n_slabs)
+                interval = 0
+            if interval > 0:
+                n_slabs = max(1, dur // interval + 1)
+                tower = static and span < CRUSH_TOWER_SPAN and n_slabs >= 2
+        if n_slabs == 1 and moves_h:
+            # a height-changing ribbon: one slab per joint point
+            n_slabs = max(1, len(pts))
+            tower = span < TOWER_INSTANT_SPAN and n_slabs >= 2
         # --- lay the slabs down along the ribbon ---
         slabs = []
         for k in range(n_slabs):
             f = 0.0 if n_slabs == 1 else k / (n_slabs - 1)
-            tk = int(round(t0 + f * dur))
-            xk = x + f * (ex - x)
-            wk = w + f * (ew - w)
-            slabs.append((tk, xk, wk))
-        tower = static and span < CRUSH_TOWER_SPAN and n_slabs >= 2
+            slabs.append((int(round(t0 + f * dur)), x + f * (ex - x),
+                          w + f * (ew - w), h + f * (eh - h)))
         plan[i] = {'slabs': slabs, 'tower': tower}
     return plan
 
@@ -1025,35 +1068,29 @@ class Converter:
         self.sc_til = None
 
     def _detect_towers(self, plan):
-        """Identify AIR-CRUSH towers from the crush plan. Two encodings both make
-        a vertical stack of coincident slabs:
+        """Identify AIR-CRUSH towers from the crush plan. Three encodings all
+        produce a vertical stack of coincident slabs:
 
-        (A) several separate 'C' groups sharing (tick, lane, width) at different
+        (A) several separate \'C\' groups sharing (tick, lane, width) at different
             heights - the classic tower (each contributes one slab);
-        (B) a single 'C' group whose plan is a short, static slab ladder - its
-            N slabs stack at the head instant.
+        (B) one \'C\' group whose plan is a short, static interval-driven ladder;
+        (C) one \'C\' group whose height changes across a near-instant ribbon -
+            its joint points are the stacked slabs.
 
-        Returns {group_index: (tower_key, [slab_heights])} where slab_heights has
-        one entry per slab that group contributes, giving its rank in the stack.
-        Groups not in any tower are absent."""
+        Returns {group_index: (tower_key, [slab_heights])}, one height per slab
+        the group contributes, so the stack can be ordered bottom-up. Groups not
+        in any tower are absent."""
         from collections import defaultdict
-        B36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        def h36(a, b):
-            return (B36.index(a) if a in B36 else 0) * 36 + (B36.index(b) if b in B36 else 0)
-        # encoding (A): group single-slab crushes by (tick, x, w)
         shared = defaultdict(list)                        # (tick,x,w) -> [(gi, height)]
         out = {}
         for gi, pl in plan.items():
             g = self.c.groups[gi]
             _tc, lane, width, extra = parse_body(g['body'])
-            if pl['tower']:                              # (B) single-group ladder tower
-                key = ('ladder', gi)
-                out[gi] = (key, list(range(len(pl['slabs']))))
+            if pl['tower']:                              # (B)/(C): stack within one group
+                out[gi] = (('stack', gi), [sl[3] for sl in pl['slabs']])
                 continue
-            if len(pl['slabs']) == 1:                    # candidate for a shared stack
-                hh = extra[:2] if len(extra) >= 2 else '00'
-                height = h36(hh[0], hh[1]) if len(hh) == 2 else 0
-                shared[(g['tick'], lane, width)].append((gi, height))
+            if len(pl['slabs']) == 1:                    # candidate for a shared stack (A)
+                shared[(g['tick'], lane, width)].append((gi, pl['slabs'][0][3]))
         for key, members in shared.items():
             heights = sorted({h for _gi, h in members})
             if len(heights) < 2:                         # need real vertical spread
@@ -1124,7 +1161,7 @@ class Converter:
                     pass                                   # decorative line: dropped
                 else:
                     tw = tower_of.get(gi)
-                    for si, (stick, sx, sw) in enumerate(pl['slabs']):
+                    for si, (stick, sx, sw, _sh) in enumerate(pl['slabs']):
                         if tw is not None:
                             # tower slabs stack at the head instant (coincident)
                             ni = self._add(9, ichi, sx, sw)
