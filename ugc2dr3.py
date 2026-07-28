@@ -519,21 +519,29 @@ class UgcChart:
 
     # measure'tick -> absolute tick, honouring @BEAT time-signature segments
     def mt_to_tick(self, measure, tick):
+        """Absolute tick of `measure`'@'`tick`. An "@BEAT m num den" line sets the
+        time signature FROM measure m onward, so every measure before the first
+        @BEAT keeps the 4/4 default. Getting that wrong silently rescales the
+        whole chart: top-level notes (which come through here) shift while LN
+        children (offset from their head by a raw tick delta) do not, so note
+        types drift apart from each other."""
+        full = self.ticks_per_beat * 4          # one 4/4 measure, in ticks
         if not self.beats:
-            return measure * self.ticks_per_beat * 4 + tick
-        # accumulate full-measure lengths up to `measure`
+            return measure * full + tick
         segs = sorted(self.beats, key=lambda b: b[0])
-        abs_meas_tick = 0
+        total = 0
         cur = 0
-        for k, (sm, num, den) in enumerate(segs):
-            nxt = segs[k + 1][0] if k + 1 < len(segs) else measure
-            seg_end = min(nxt, measure)
-            if seg_end > cur:
-                mlen = self.ticks_per_beat * 4 * num // den
-                abs_meas_tick += (seg_end - cur) * mlen
-                cur = seg_end
-            if cur >= measure: break
-        return abs_meas_tick + tick
+        num, den = 4, 4                          # default until the first @BEAT
+        for sm, snum, sden in segs:
+            if sm >= measure:
+                break                            # this signature starts after us
+            if sm > cur:
+                total += (sm - cur) * (full * num // den)
+                cur = sm
+            num, den = snum, sden
+        if measure > cur:
+            total += (measure - cur) * (full * num // den)
+        return total + tick
 
     # DR3 measure position ("ichi") for an absolute tick. DR3 measure = 4 beats,
     # so ichi = tick / (ticks_per_beat * 4). This yields correct AUDIO TIMING
