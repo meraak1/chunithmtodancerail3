@@ -102,7 +102,7 @@
   </div>
 
   <p class="about">This is a converter that will convert UMIGURI beatmaps to
-    DanceRail3 charts. Only UMIGURI beatmaps (.ugc) are supported. Official CHUNITHM charts cannot be converted.<br>
+    DanceRail3 charts. Only UMIGURI beatmaps (.ugc) are supported.<br>
     To find UMIGURI beatmaps, check <a class="link" href="https://pgko.dev" target="_blank"
     rel="noopener">pgko.dev</a> and the UMIGURI Discord server
     (<a class="link" href="https://discord.com/invite/j6mEU2hQDZ" target="_blank"
@@ -116,6 +116,9 @@
 const $ = id => document.getElementById(id);
 const logEl = $('log');
 function log(msg, cls){ const s=document.createElement('span'); if(cls)s.className=cls; s.textContent=msg+"\n"; logEl.appendChild(s); logEl.scrollTop=logEl.scrollHeight; }
+const BASE_TITLE='UGC \u2192 DR3';
+// mirror conversion progress into the tab title so it's visible while the tab is in the background
+function setTitle(s){ document.title = s ? BASE_TITLE+' ('+s+')' : BASE_TITLE; }
 function setProgress(p, text){ p=Math.max(0,Math.min(100,p)); $('fill').style.width=p+'%'; $('ptext').textContent=text||Math.round(p)+'%'; }
 
 // Shown when this browser has WebAssembly turned off (some Chromium builds, Android
@@ -275,7 +278,7 @@ async function squarePng(bytes){
 $('go').addEventListener('click', async ()=>{
   if(!filesList.length){ log('Pick at least one .zip first.','w'); return; }
   $('go').disabled=true; $('downloads').innerHTML=''; $('outPanel').style.display='none';
-  results=[]; $('count').textContent='0/'+filesList.length;
+  results=[]; $('count').textContent='0/'+filesList.length; setTitle('0/'+filesList.length);
   const opts={ density:'1/4', sign:'-', headtap:true, flicktap:false };
   let done=0;
   for(let i=0;i<filesList.length;i++){
@@ -352,8 +355,10 @@ $('go').addEventListener('click', async ()=>{
     }
     setProgress((i+1)/filesList.length*100);
     $('count').textContent=(i+1)+'/'+filesList.length;
+    setTitle((i+1)+'/'+filesList.length);
   }
   log(`\nFinished: ${done}/${filesList.length} converted.`, done?'ok':'e');
+  setTitle('Done!');
   $('go').disabled=false;
 });
 
