@@ -715,6 +715,50 @@ def stack_notes_3d(layers, scs):
         n['width'] = round(nw, 5)
         n['x'] = round(nc - nw / 2.0, 5)
 
+FLATTEN_HMAX, FLATTEN_T = 0.45, 0.85   # editor\'s "Flatten notes" ceiling / curve changeover
+
+def flatten_notes_3d(pairs, scs):
+    """Port of dr3editor.py\'s "Flatten notes": place each note at its own
+    height so a whole structure keeps its shape, instead of a plain even stack.
+
+    pairs is [(note, frac), ...] with frac in [0, 1] giving each note\'s height
+    as a fraction of the ceiling. Unlike the 3D Stacker (which spaces layers by
+    RANK), the height here is proportional, so uneven structures - a pyramid, an
+    arrow, a zigzag - keep their real proportions. Notes sharing a frac share a
+    height, and a lone note at its own frac simply floats there rather than
+    forming a tower, which is what makes shapes come out right.
+
+    Uses the editor\'s taller ceiling (0.45H vs the stacker\'s 0.40H) with the
+    changeover pulled back to 0.85 so the top level\'s entry speed stays healthy.
+    Mutates the notes in place."""
+    import math
+    if not pairs:
+        return
+    C0, H0 = 0.0125, 0.30
+    SHIFT_CAL = 0.25 / (math.sqrt(1.0 / 0.7) - 1.0)
+    SC = sc_at_beat(scs, pairs[0][0]['beat'])
+    def _f(v):
+        t = f"{v:.5f}".rstrip('0').rstrip('.')
+        return t if t else "0"
+    for n, frac in pairs:
+        h = FLATTEN_HMAX * max(0.0, min(1.0, frac))
+        if h < 1e-9:
+            # ground level: normal-speed note on an SC-scaled identity curve, so
+            # it stays locked to the levels above and to nearby notes
+            n['nsc'] = f"10:{_f(round(10.0 * SC, 5))};-1:{_f(round(-SC, 5))}"
+            continue
+        s = 1.0 / (1.0 - h)                 # scroll rate for that height
+        c = C0 * (h / H0)                   # hover above the line at the hit
+        kg = math.sqrt(s)                   # perspective factor
+        n['nsc'] = (f"2:{_f(round(2.0 * SC, 5))};"
+                    f"{_f(FLATTEN_T)}:{_f(round(SC * (FLATTEN_T * s + c), 5))};"
+                    f"0:{_f(round(SC * c, 5))}")
+        ow = n['width']; oc = n['x'] + ow / 2.0
+        nw = clamp_width(ow * (1.0 + 0.8 * (kg - 1.0)))
+        nc = oc + SHIFT_CAL * (kg - 1.0) * (oc - 8.0)
+        n['width'] = round(nw, 5)
+        n['x'] = round(nc - nw / 2.0, 5)
+
 LN_KINDS = {'h': (3, 11, 4), 'H': (3, 11, 4),      # holds, air-holds -> orange hold LN
             's': (5, 6, 7),  'S': (5, 6, 7)}        # slides, air-slides -> blue slide LN
 
@@ -832,10 +876,17 @@ def air_crush_plan(chart):
             if interval > 0:
                 n_slabs = max(1, dur // interval + 1)
                 tower = static and span < CRUSH_TOWER_SPAN and n_slabs >= 2
-        if n_slabs == 1 and moves_h:
-            # a height-changing ribbon: one slab per joint point
-            n_slabs = max(1, len(pts))
-            tower = span < TOWER_INSTANT_SPAN and n_slabs >= 2
+        if (dens is None and n_slabs == 1 and moves_h
+                and span < TOWER_INSTANT_SPAN and len(pts) >= 3):
+            # Old payload (no interval field) drawn all at once while changing
+            # height, with INTERMEDIATE joints: those joints mark the stacked
+            # slab positions, so the ribbon is a vertical tower of that many.
+            # Excluded: a '$' note (the spec gives it exactly one slab), a ribbon
+            # that advances in time (a single sloped bar), and a plain
+            # head-to-endpoint ribbon with no joints between them - however
+            # slanted, that is drawn as one bar, not a stack.
+            n_slabs = len(pts)
+            tower = True
         # --- lay the slabs down along the ribbon ---
         slabs = []
         for k in range(n_slabs):
@@ -1061,6 +1112,7 @@ class Converter:
         self.towers_capped = 0
         self.towers_grounded = 0
         self.towers_fattened = 0
+        self.towers_shaped = 0
         self.mover_added = False
         self._cur_til = 0
         self.scs = None           # [(speed, measure)] for #SC/#SCI, None = default
@@ -1255,26 +1307,31 @@ class Converter:
                 return
 
     def _build_towers(self):
-        """Convert tagged AIR-CRUSH tower members into DR3 3D stacks using the
-        editor\'s stacker math. Runs after SC is decided so curves scale to it.
+        """Turn tagged AIR-CRUSH slabs into DR3 3D structures. Runs after SC is
+        decided so the curves scale to it.
 
-        If a tower sits on top of an ordinary note at the same beat and lane (an
-        up-flick, ExTap, tap, ...), that note becomes the stack\'s GROUND layer so
-        every slab floats ABOVE it: nothing type-9 is left on the ground beside
-        the real note, and no non-type-9 note is ever lifted into the air. The
-        slab count is preserved (a 6-height tower shows 6 airborne slabs over the
-        ground note). Without such a ground note the lowest slab is the ground,
-        as before.
+        Slabs at the same instant form one STRUCTURE, split into columns (one per
+        lane span). How it is rendered depends on the shape:
 
-        Air slabs are capped at TOWER_MAX_LAYERS: past ~5 the NSC illusion breaks
-        down, so a taller tower keeps that many evenly-spaced slabs (lowest + top)
-        and drops the surplus entirely."""
+        PLAIN - every column holds the same set of heights, and no column leans or
+            changes width: this is just a tower (or a row of identical towers), so
+            each is built with the 3D Stacker\'s even RANK spacing, capped at
+            TOWER_MAX_LAYERS and grounded on any ordinary note beneath it. Output
+            is unchanged from before.
+
+        SHAPED - anything else: columns at differing heights that together draw a
+            figure (an arrow, a V, a staircase), or a single column that leans or
+            tapers. These use the editor\'s "Flatten notes" math, which places
+            every slab at a height PROPORTIONAL to its source height, measured
+            across the whole structure at once. That keeps the real figure instead
+            of collapsing each column to an identical even stack. No layer cap is
+            applied, since dropping slabs would break the figure."""
         from collections import defaultdict
-        towers = defaultdict(list)
+        columns = defaultdict(list)
         for n in self.notes:
             tw = n.get('_tower')
             if tw is not None:
-                towers[tw[0]].append((tw[1], n))          # (source_height, note)
+                columns[tw[0]].append((tw[1], n))          # (source_height, note)
         # index ordinary (non-tower) notes by beat for ground-note lookup.
         # LN-involved notes are excluded: the game force-clears NSC on LN links,
         # so they can\'t carry the ground layer\'s identity curve.
@@ -1287,55 +1344,91 @@ class Converter:
         for gi, n in enumerate(self.notes):
             if '_tower' not in n and gi not in ln_involved:
                 ground_by_beat[round(n['beat'], 5)].append(n)
-        built = layers_total = capped = grounded = fattened = 0
-        drop = set()
-        used_ground = set()
-        for tkey, members in towers.items():
-            if len(members) < 2:
-                continue                                  # tower lost members; skip
-            members.sort(key=lambda hn: hn[0])            # lowest slab first
-            slabs = [n for _h, n in members]
-            # look for an ordinary note under this tower to act as the ground so
-            # the slabs are erected above it (matched on the tower's lane span,
-            # taken from the lowest slab before any stacker shift is applied).
+        # group the columns into per-instant structures
+        structures = defaultdict(list)
+        for tkey, members in columns.items():
+            if len(members) < 2 and len(columns) == 1:
+                continue
+            if not members:
+                continue
+            members.sort(key=lambda hn: hn[0])
+            structures[round(members[0][1]['beat'], 5)].append((tkey, members))
+
+        built = layers_total = capped = grounded = fattened = shaped = 0
+        drop = set(); used_ground = set()
+
+        def find_ground(slabs, beat):
             tx = min(n['x'] for n in slabs)
             tw_ = max(n['x'] + n['width'] for n in slabs) - tx
-            g = None
-            for cand in ground_by_beat.get(round(slabs[0]['beat'], 5), ()):
+            for cand in ground_by_beat.get(round(beat, 5), ()):
                 if id(cand) in used_ground:
                     continue
                 cl, cr = cand['x'], cand['x'] + cand['width']
-                if cl <= tx + 1e-6 and tx + (tw_ or 1) <= cr + 1e-6 or \
-                   tx <= cl + 1e-6 and cl + cand['width'] <= tx + (tw_ or 1) + 1e-6:
-                    g = cand; break
-            # cap TOTAL layers (ground note included) at TOWER_MAX_LAYERS: past
-            # ~5 the NSC illusion breaks down. A grounded tower therefore keeps at
-            # most TOWER_MAX_LAYERS-1 airborne slabs; a free-standing one keeps
-            # TOWER_MAX_LAYERS. Surplus slabs (evenly spaced, lowest+top kept) are
-            # dropped from the chart entirely.
-            max_slabs = TOWER_MAX_LAYERS - (1 if g is not None else 0)
-            if len(slabs) > max_slabs:
-                capped += 1
-                keep = {round(i * (len(slabs) - 1) / (max_slabs - 1))
-                        for i in range(max_slabs)}
-                for j, n in enumerate(slabs):
-                    if j not in keep:
-                        drop.add(id(n))
-                slabs = [n for j, n in enumerate(slabs) if j in keep]
-            if g is not None:
-                used_ground.add(id(g)); grounded += 1
-                layers = [g] + slabs                      # real note grounds the stack
-            else:
-                layers = slabs                            # lowest slab is the ground
-            stack_notes_3d(layers, self.scs)
-            # The outward lean can push a flick fully off the highway (no part of
-            # it in [0, HIGHWAY_WIDTH]). If so, fatten the WHOLE tower uniformly -
-            # only the type-9 flicks, never a non-flick ground - by the amount
-            # that brings the furthest-out flick 1 unit back in bounds. Fattening
-            # keeps each note's centre fixed, so the stack's shape is preserved.
-            if self._fatten_tower(layers):
-                fattened += 1
-            built += 1; layers_total += len(slabs)
+                if (cl <= tx + 1e-6 and tx + (tw_ or 1) <= cr + 1e-6) or \
+                   (tx <= cl + 1e-6 and cl + cand['width'] <= tx + (tw_ or 1) + 1e-6):
+                    return cand
+            return None
+
+        for beat, cols in structures.items():
+            # -- is this a plain tower / row of identical towers, or a figure? --
+            height_sets = {tuple(round(h, 5) for h, _n in mem) for _k, mem in cols}
+            uniform = True
+            for _k, mem in cols:
+                widths = {round(n['width'], 5) for _h, n in mem}
+                centres = {round(n['x'] + n['width'] / 2.0, 5) for _h, n in mem}
+                if len(widths) > 1 or len(centres) > 1:
+                    uniform = False                       # this column tapers or leans
+                    break
+            plain = uniform and len(height_sets) == 1
+
+            if plain:
+                for _k, mem in cols:
+                    if len(mem) < 2:
+                        continue
+                    slabs = [n for _h, n in mem]
+                    g = find_ground(slabs, beat)
+                    max_slabs = TOWER_MAX_LAYERS - (1 if g is not None else 0)
+                    if len(slabs) > max_slabs:
+                        capped += 1
+                        keep = {round(i * (len(slabs) - 1) / (max_slabs - 1))
+                                for i in range(max_slabs)}
+                        for j, n in enumerate(slabs):
+                            if j not in keep:
+                                drop.add(id(n))
+                        slabs = [n for j, n in enumerate(slabs) if j in keep]
+                    if g is not None:
+                        used_ground.add(id(g)); grounded += 1
+                        layers = [g] + slabs
+                    else:
+                        layers = slabs
+                    stack_notes_3d(layers, self.scs)
+                    if self._fatten_tower(layers):
+                        fattened += 1
+                    built += 1; layers_total += len(slabs)
+                continue
+
+            # -- SHAPED: heights proportional across the whole structure --
+            all_h = [h for _k, mem in cols for h, _n in mem]
+            hlo, hhi = min(all_h), max(all_h)
+            rng = hhi - hlo
+            # If an ordinary note sits under the figure, keep every slab above it
+            # so no flick shares the ground with a real note.
+            any_slab = [n for _k, mem in cols for _h, n in mem]
+            floor = 0.0
+            if find_ground(any_slab, beat) is not None:
+                floor = 1.0 / (len({round(h, 5) for h in all_h}) + 1)
+            pairs = []
+            for _k, mem in cols:
+                for h, n in mem:
+                    t = 0.0 if rng <= 1e-9 else (h - hlo) / rng
+                    pairs.append((n, floor + t * (1.0 - floor)))
+            flatten_notes_3d(pairs, self.scs)
+            for _k, mem in cols:                          # keep each column on-screen
+                if self._fatten_tower([n for _h, n in mem]):
+                    fattened += 1
+            shaped += 1
+            built += len(cols); layers_total += len(pairs)
+
         if drop:
             remap, kept = {}, []
             for old_i, n in enumerate(self.notes):
@@ -1352,6 +1445,7 @@ class Converter:
         self.towers_capped = capped
         self.towers_grounded = grounded
         self.towers_fattened = fattened
+        self.towers_shaped = shaped
 
     def _fatten_tower(self, layers):
         """If any type-9 flick in this tower is fully off the highway (no part
